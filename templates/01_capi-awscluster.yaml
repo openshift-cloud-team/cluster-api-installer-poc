@@ -1,0 +1,105 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSCluster
+metadata:
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+  name: ${INFRA_ID}
+  namespace: openshift-cluster-api-guests
+spec:
+  controlPlaneLoadBalancer:
+    name: ${INFRA_ID}-ext
+    scheme: internet-facing
+    loadBalancerType: nlb
+  identityRef:
+    kind: AWSClusterRoleIdentity
+    name: ${INFRA_ID}-installer
+  region: ${REGION}
+  # The AWS CCM expects only a single tagged security group.
+  # CAPA creates a separate LB security group for this purpose.
+  # We cannot tag the controlplane and node security groups without breaking the CCM.
+  #additionalTags:
+  #  kubernetes.io/cluster/${INFRA_ID}: owned
+  network:
+    vpc:
+      availabilityZoneUsageLimit: 6
+      availabilityZoneSelection: Ordered
+    cni:
+      cniIngressRules:
+      - description: Port 9000-9999 for node ports (TCP)
+        fromPort: 9000
+        protocol: tcp
+        toPort: 9999
+      - description: Port 9000-9999 for node ports (UDP)
+        fromPort: 9000
+        protocol: udp
+        toPort: 9999
+      - description: Port 6441-6442 (TCP)
+        fromPort: 6441
+        protocol: tcp
+        toPort: 6442
+      - description: Port 6081 (UDP)
+        fromPort: 6081
+        protocol: udp
+        toPort: 6081
+      - description: Port 500 (UDP)
+        fromPort: 500
+        protocol: udp
+        toPort: 500
+      - description: Port 4789 (UDP)
+        fromPort: 4789
+        protocol: udp
+        toPort: 4789
+      - description: Port 4500 (UDP)
+        fromPort: 4500
+        protocol: udp
+        toPort: 4500
+      # - description: Port 30000-32767 for node ports (TCP)
+      #   fromPort: 30000
+      #   protocol: tcp
+      #   toPort: 32767
+      # - description: Port 30000-32767 for node ports (UDP)
+      #   fromPort: 30000
+      #   protocol: udp
+      #   toPort: 32767
+      # - description: Port 10250 (TCP)
+      #   fromPort: 10250
+      #   protocol: tcp
+      #   toPort: 10250
+      - description: Port 10257 (TCP)
+        fromPort: 10257
+        protocol: tcp
+        toPort: 10257
+      - description: Port 10259 (TCP)
+        fromPort: 10259
+        protocol: tcp
+        toPort: 10259
+    subnets:
+    - availabilityZone: ${REGION}a
+      isPublic: false
+      cidrBlock: 10.0.0.0/19
+      id: ${INFRA_ID}-private-${REGION}a
+    - availabilityZone: ${REGION}b
+      isPublic: false
+      cidrBlock: 10.0.32.0/19
+      id: ${INFRA_ID}-private-${REGION}b
+    - availabilityZone: ${REGION}c
+      isPublic: false
+      cidrBlock: 10.0.64.0/19
+      id: ${INFRA_ID}-private-${REGION}c
+    - availabilityZone: ${REGION}a
+      isPublic: true
+      cidrBlock: 10.0.128.0/19
+      id: ${INFRA_ID}-public-${REGION}a
+    - availabilityZone: ${REGION}b
+      isPublic: true
+      cidrBlock: 10.0.160.0/19
+      id: ${INFRA_ID}-public-${REGION}b
+    - availabilityZone: ${REGION}c
+      isPublic: true
+      cidrBlock: 10.0.192.0/19
+      id: ${INFRA_ID}-public-${REGION}c
+  s3Bucket:
+    name: ${INFRA_ID}-cluster-api-ignition
+    controlPlaneIAMInstanceProfile: ${INFRA_ID}-master-role
+    nodesIAMInstanceProfiles:
+    - ${INFRA_ID}-worker-role
