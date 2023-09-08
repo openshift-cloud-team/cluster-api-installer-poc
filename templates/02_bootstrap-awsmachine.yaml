@@ -11,7 +11,7 @@ spec:
     version: "3.2"
   uncompressedUserData: true
   iamInstanceProfile: ${INFRA_ID}-master-profile
-  instanceType: m5.large
+  instanceType: m6i.xlarge
   ami:
     id: ami-0e3844336e31a8ed0
   subnet:
