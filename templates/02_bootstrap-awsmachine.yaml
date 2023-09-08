@@ -26,6 +26,10 @@ spec:
     - name: tag:Name
       values:
       - ${INFRA_ID}-ocp-controlplane
+  - filters:
+    - name: tag:Name
+      values:
+      - ${INFRA_ID}-ocp-bootstrap
   rootVolume:
     size: 120
     type: gp3
