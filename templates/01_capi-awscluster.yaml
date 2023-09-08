@@ -25,6 +25,10 @@ spec:
       availabilityZoneSelection: Ordered
     cni:
       cniIngressRules:
+      - description: ICMP
+        fromPort: -1
+        protocol: icmp
+        toPort: -1
       - description: Port 9000-9999 for node ports (TCP)
         fromPort: 9000
         protocol: tcp

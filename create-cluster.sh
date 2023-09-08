@@ -17,12 +17,12 @@ AWS=${AWS:-aws}
 # - Security group name for MAPI is not the same as CAPI
 #   - SG names in machinesets/machines/controlplanemachineset need updates
 # - No SSH to bootstrap node by default
+# - Address bootstrap ignition feature gate issue
 
 # TODO: 
 # - Security group rules created by installer are not the same as created by CAPI
 #   - This is largely fixed now, but still not identical, needs a thorough review
 # - On delete, destroy LB first
-# - Address bootstrap ignition feature gate issue
 # - Installer should delete resources created by CAPI tags (not all will have cluster tag - ref SG issue)
 
 #
@@ -346,6 +346,12 @@ control_plane_sg_id=$(${AWS} ec2 describe-security-groups --region ${region} --f
 #control_plane_sg_id=$(${OC} get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.status.networkStatus.securityGroups.controlplane.id')
 control_plane_sg_rules=$(${AWS} ec2 describe-security-group-rules --region ${region} --filter Name="group-id",Values="${control_plane_sg_id}" | jq -r '.SecurityGroupRules[]')
 
+worker_sg_id=$(${AWS} ec2 describe-security-groups --region ${region} --filter Name="group-name",Values="${infra_id}-ocp-worker" | jq -r '.SecurityGroups[0].GroupId')
+#worker_sg_id=$(${OC}  get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.status.networkStatus.securityGroups.node.id')
+worker_sg_rules=$(${AWS} ec2 describe-security-group-rules --region ${region} --filter Name="group-id",Values="${worker_sg_id}" | jq -r '.SecurityGroupRules[]')
+
+# Control Plane rules
+
 if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 22623) | select(.ToPort == 22623) | select(.CidrIpv4 == "10.0.0.0/16")')" ]; then
     echo "Creating control plane security group rule for port 22623"
     ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 22623 --cidr 10.0.0.0/16
@@ -356,9 +362,37 @@ if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| se
     ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 22 --cidr 10.0.0.0/16
 fi
 
-worker_sg_id=$(${AWS} ec2 describe-security-groups --region ${region} --filter Name="group-name",Values="${infra_id}-ocp-worker" | jq -r '.SecurityGroups[0].GroupId')
-#worker_sg_id=$(${OC}  get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.status.networkStatus.securityGroups.node.id')
-worker_sg_rules=$(${AWS} ec2 describe-security-group-rules --region ${region} --filter Name="group-id",Values="${worker_sg_id}" | jq -r '.SecurityGroupRules[]')
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 10250) | select(.ToPort == 10250) | select(.ReferencedGroupInfo.GroupId == "'${control_plane_sg_id}'")')" ]; then
+    echo "Creating control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 10250 --source-group ${control_plane_sg_id}
+fi
+
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 10250) | select(.ToPort == 10250) | select(.ReferencedGroupInfo.GroupId == "'${worker_sg_id}'")')" ]; then
+    echo "Creating worker to control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 10250 --source-group ${worker_sg_id}
+fi
+
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 30000) | select(.ToPort == 32767) | select(.ReferencedGroupInfo.GroupId == "'${control_plane_sg_id}'")')" ]; then
+    echo "Creating control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 30000-32767 --source-group ${control_plane_sg_id}
+fi
+
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 30000) | select(.ToPort == 32767) | select(.ReferencedGroupInfo.GroupId == "'${worker_sg_id}'")')" ]; then
+    echo "Creating control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol tcp --port 30000-32767 --source-group ${worker_sg_id}
+fi
+
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "udp")| select(.FromPort == 30000) | select(.ToPort == 32767) | select(.ReferencedGroupInfo.GroupId == "'${control_plane_sg_id}'")')" ]; then
+    echo "Creating control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol udp --port 30000-32767 --source-group ${control_plane_sg_id}
+fi
+
+if [ -z "$(echo ${control_plane_sg_rules} | jq 'select(.IpProtocol == "udp")| select(.FromPort == 30000) | select(.ToPort == 32767) | select(.ReferencedGroupInfo.GroupId == "'${worker_sg_id}'")')" ]; then
+    echo "Creating control plane security group rule for port 10250"
+    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${control_plane_sg_id} --protocol udp --port 30000-32767 --source-group ${worker_sg_id}
+fi
+
+# Worker rules
 
 if [ -z "$(echo ${worker_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 22) | select(.ToPort == 22) | select(.CidrIpv4 == "10.0.0.0/16")')" ]; then
     echo "Creating worker security group rule for port 22"
