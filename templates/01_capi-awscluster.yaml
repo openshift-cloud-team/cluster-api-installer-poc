@@ -20,6 +20,34 @@ spec:
   #additionalTags:
   #  kubernetes.io/cluster/${INFRA_ID}: owned
   network:
+    additionalControlPlaneIngressRules:
+    - description: MCS traffic from cluster network
+      protocol: tcp
+      fromPort: 22623
+      toPort: 22623
+      cidrBlocks:
+      - 10.0.0.0/16
+    - description: Kubelet traffic from nodes
+      protocol: tcp
+      fromPort: 10250
+      toPort: 10250
+      sourceSecurityGroupRoles:
+      - node
+      - controlplane
+    - description: Service node ports (TCP)
+      protocol: tcp
+      fromPort: 30000
+      toPort: 32767
+      sourceSecurityGroupRoles:
+      - node
+      - controlplane
+    - description: Service node ports (UDP)
+      protocol: udp
+      fromPort: 30000
+      toPort: 32767
+      sourceSecurityGroupRoles:
+      - node
+      - controlplane
     vpc:
       availabilityZoneUsageLimit: 6
       availabilityZoneSelection: Ordered
@@ -57,18 +85,6 @@ spec:
         fromPort: 4500
         protocol: udp
         toPort: 4500
-      # - description: Port 30000-32767 for node ports (TCP)
-      #   fromPort: 30000
-      #   protocol: tcp
-      #   toPort: 32767
-      # - description: Port 30000-32767 for node ports (UDP)
-      #   fromPort: 30000
-      #   protocol: udp
-      #   toPort: 32767
-      # - description: Port 10250 (TCP)
-      #   fromPort: 10250
-      #   protocol: tcp
-      #   toPort: 10250
       - description: Port 10257 (TCP)
         fromPort: 10257
         protocol: tcp
@@ -77,6 +93,14 @@ spec:
         fromPort: 10259
         protocol: tcp
         toPort: 10259
+      - description: Port 22 (TCP)
+        fromPort: 22
+        protocol: tcp
+        toPort: 22
+      - description: ESP
+        fromPort: -1
+        protocol: "50"
+        toPort: -1
     subnets:
     - availabilityZone: ${REGION}a
       isPublic: false

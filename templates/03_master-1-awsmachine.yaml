@@ -21,11 +21,6 @@ spec:
       - ${INFRA_ID}-private-${REGION}b
   additionalTags:
     kubernetes.io/cluster/${INFRA_ID}: owned
-  additionalSecurityGroups:
-  - filters:
-    - name: tag:Name
-      values:
-      - ${INFRA_ID}-ocp-controlplane
   rootVolume:
     size: 120
     type: gp3
