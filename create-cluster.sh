@@ -21,9 +21,9 @@ AWS=${AWS:-aws}
 # - See if https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/4359 will help with control plane SG rules
 # - Security group rules created by installer are not the same as created by CAPI
 #   - This is largely fixed now, but still not identical, needs a thorough review
+# - On delete, destroy LB first
 
 # TODO: 
-# - On delete, destroy LB first
 # - Installer should delete resources created by CAPI tags (not all will have cluster tag - ref SG issue)
 # - Should be able to determine if API is available not just bootstrap API, to allow reentrant bootstrap
 
@@ -272,7 +272,7 @@ if [ -z ${internal_hosted_zone_id} ]; then
     ${AWS} route53 create-hosted-zone --region ${region} --name ${cluster_domain} --caller-reference $(date +%s) --hosted-zone-config Comment="Hosted zone for ${cluster_domain}",PrivateZone=true --vpc VPCRegion=${region},VPCId=${vpc_id}
     internal_hosted_zone_id=$(${AWS} route53 list-hosted-zones-by-name --region ${region} --dns-name ${cluster_domain} | jq -r ".HostedZones[] | select(.Name == \"${cluster_domain}.\") | .Id")
 
-    ${AWS} route53 change-tags-for-resource --resource-type hostedzone --resource-id $(echo ${internal_hosted_zone_id} | cut -d/ -f 3) --add-tags Key=kubernetes.io/cluster/${infra_id},Value=owned
+    ${AWS} route53 change-tags-for-resource --resource-type hostedzone --resource-id $(echo ${internal_hosted_zone_id} | cut -d/ -f 3) --add-tags Key=kubernetes.io/cluster/${infra_id},Value=owned Key=Name,Value=${infra_id}-int
 fi
 
 existing_internal_records=$(${AWS} route53 list-resource-record-sets --hosted-zone-id ${internal_hosted_zone_id} --query "ResourceRecordSets[?Name == 'api.${cluster_domain}.']")
