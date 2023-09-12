@@ -22,10 +22,11 @@ AWS=${AWS:-aws}
 # - Security group rules created by installer are not the same as created by CAPI
 #   - This is largely fixed now, but still not identical, needs a thorough review
 # - On delete, destroy LB first
+# - Should be able to determine if API is available not just bootstrap API, to allow reentrant bootstrap
+# - Should create kubeconfig in cluster to allow access to bootstrap API
 
 # TODO: 
 # - Installer should delete resources created by CAPI tags (not all will have cluster tag - ref SG issue)
-# - Should be able to determine if API is available not just bootstrap API, to allow reentrant bootstrap
 
 #
 # BEGIN: Setup of script prerequisites
@@ -95,6 +96,9 @@ for role in {bootstrap,master,worker}; do
     # Note: when applied to the clustser, we add an owner reference to these secrets to link them to the Cluster object
     ${OC} create secret generic --dry-run=client --namespace openshift-cluster-api-guests ${infra_id}-${role}-user-data  --from-literal format=ignition --from-file=value=${CLUSTER_DIR}/${role}.ign -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_${role}-user-data-secret.yaml 
 done
+
+# Cluster API expects a kubeconfig to be able to talk to the guest cluster
+${OC} create secret generic --dry-run=client --namespace openshift-cluster-api-guests ${infra_id}-kubeconfig --from-file=value=${CLUSTER_DIR}/auth/kubeconfig -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_kubeconfig-secret.yaml
 
 #
 # END: Create Cluster API manifests
@@ -389,12 +393,12 @@ if [ "${cluster_bootstrapped}" != "True" ]; then
         ${AWS} elbv2 register-targets --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${bootstrap_id}"
     fi
 
-    while [ $(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${api_target_arn} --targets "Id=${bootstrap_id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State') != "healthy" ]; do
+    while [ "$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${api_target_arn} | jq -r '.TargetHealthDescriptions[].TargetHealth.State | select(. == "healthy")' | uniq)" != "healthy" ]; do
         echo "Waiting for bootstrap API to be ready"
         sleep 5
     done
 
-    while [ $(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${bootstrap_id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State') != "healthy" ]; do
+    while [ "$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${mcs_target_arn} | jq -r '.TargetHealthDescriptions[].TargetHealth.State | select(. == "healthy")' | uniq)" != "healthy" ]; do
         echo "Waiting for bootstrap MCS to be ready"
         sleep 5
     done
