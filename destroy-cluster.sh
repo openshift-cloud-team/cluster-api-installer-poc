@@ -4,7 +4,6 @@ CLUSTER_DIR=$1
 OPENSHIFT_INSTALL=${OPENSHIFT_INSTALL:-openshift-install}
 SCRIPT_ROOT=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)
 OC=${OC:-oc}
-AWS=${AWS:-aws}
 
 if [ -z "${CLUSTER_DIR}" ]; then
     echo "Usage: ./destroy-cluster.sh <cluster-dir>"
@@ -22,8 +21,6 @@ if [ ! -f "${CLUSTER_DIR}/metadata.json" ]; then
 fi
 
 infra_id=$(jq -r '.infraID' ${CLUSTER_DIR}/metadata.json)
-region=$(jq -r '.aws.region' ${CLUSTER_DIR}/metadata.json)
-aws_account_id=$(${AWS} sts get-caller-identity --query Account --output text)
 
 if [ -d "${CLUSTER_DIR}/cluster-api-manifests" ]; then
    rm -rf ${CLUSTER_DIR}/cluster-api-manifests
@@ -55,31 +52,6 @@ ${OC} delete cluster --namespace openshift-cluster-api-guests ${infra_id} --wait
 while [ "$(${OC} get machines -n openshift-cluster-api-guests -o json -l cluster.x-k8s.io/cluster-name=${infra_id} | jq -r '.items[]')" != "" ]; do
     echo "Waiting for machines to be deleted"
     sleep 5
-done
-
-vpc_id=$(${OC} get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.spec.network.vpc.id')
-
-### Delete the internal load balancer and any service created load balancer
-
-lb_arns=$(${AWS} elbv2 describe-load-balancers --region ${region} | jq -r '.LoadBalancers[] | select(.VpcId == "'${vpc_id}'") | .LoadBalancerArn')
-echo "Deleting load balancers"
-for arn in ${lb_arns}; do
-    if [ -z "${arn}" ]; then
-        continue
-    fi
-    ${AWS} elbv2 delete-load-balancer --region ${region} --load-balancer-arn "${arn}"
-done
-
-security_group_ids=$(${AWS} ec2 describe-security-groups --region ${region} --filters Name="tag-key",Values="kubernetes.io/cluster/${infra_id}" | jq -r '.SecurityGroups[].GroupId')
-echo "Deleting security groups"
-for id in ${security_group_ids}; do
-    if [ -z "${id}" ]; then
-        continue
-    fi
-    while ! ${AWS} ec2 delete-security-group --region ${region} --group-id "${id}"; do
-        echo "Waiting for security group dependents to be removed"
-        sleep 10
-    done
 done
 
 # Wait for the cluster to go away.

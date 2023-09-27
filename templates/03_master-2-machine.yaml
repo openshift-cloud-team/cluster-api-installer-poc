@@ -11,6 +11,5 @@ spec:
   clusterName: ${INFRA_ID} 
   infrastructureRef:
     apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
-    kind: AWSMachine
+    kind: OpenStackMachine
     name: ${INFRA_ID}-master-2
-  failureDomain: ${REGION}c

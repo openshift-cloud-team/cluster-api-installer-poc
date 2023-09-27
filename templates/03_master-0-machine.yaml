@@ -10,7 +10,6 @@ spec:
     dataSecretName: ${INFRA_ID}-master-user-data
   clusterName: ${INFRA_ID} 
   infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
-    kind: AWSMachine
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha7
+    kind: OpenStackMachine
     name: ${INFRA_ID}-master-0
-  failureDomain: ${REGION}a

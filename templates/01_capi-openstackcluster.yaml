@@ -1,0 +1,25 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: OpenStackCluster
+metadata:
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+  name: ${INFRA_ID}
+  namespace: openshift-cluster-api-guests
+spec:
+  apiServerLoadBalancer:
+    enabled: true
+    # This is not secure as it allows traffic from any CIDR and on both TCP & UDP
+    # but it's enough for a PoC
+    additionalPorts:
+    - 22623 # MachineConfig Server
+  cloudName: ${OS_CLOUD}
+  dnsNameservers:
+  - 1.1.1.1
+  externalNetworkId: ${OPENSTACK_EXTERNAL_NETWORK_ID}
+  nodeCidr: 10.128.0.0/14
+  apiServerFloatingIP: <to figure this out>
+  managedSecurityGroups: true
+  allowAllInClusterTraffic: true # unsecure for now but enough for the PoC
+  identityRef:
+    kind: Secret
+    name: ${CLUSTER_NAME}-cloud-config

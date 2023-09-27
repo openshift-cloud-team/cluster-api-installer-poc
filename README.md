@@ -1,35 +1,32 @@
-# POC: Deploy OpenShift 4 via Cluster API on AWS
+# POC: Deploy OpenShift 4 via Cluster API on OpenStack
 
-This repository aims to capture a proof-of-concept for provisioning the infrastructure required to deploy an OpenShift 4 cluster on AWS using Cluster API.
+This repository aims to capture a proof-of-concept for provisioning the infrastructure required to deploy an OpenShift 4 cluster on OpenStack using Cluster API.
 
 ## What does this POC do?
 
-This POC will deploy an OpenShift 4 cluster on AWS using Cluster API.
+This POC will deploy an OpenShift 4 cluster on OpenStack using Cluster API.
 
-Based on a basic `install-config.yaml`, it will create the AWS infrastrutcure required to run an OpenShift 4 cluster, and then use Cluster API to deploy the cluster.
+Based on a basic `install-config.yaml`, it will create the OpenStack infrastrutcure required to run an OpenShift 4 cluster, and then use Cluster API to deploy the cluster.
 Note that it does not support customisation of the infrastructure and is not intended to be used for anything other than a POC.
 
 The `create-cluster.sh` script forms the basis of this install, combined with a number of [templates][./templates] for the Cluster API resources.
 
 The script will:
 * Take an `install-config.yaml`, generate manifests and ignition from it and adjust the Machine API related resources to use the modified infrastructure toplogy
-* Create an AWS role for the management cluster to allow Cluster API to create the infrastructure
-* Create the worker and control plane IAM roles used by EC2 instances within the cluster
-* Create the internal load balancer and manage attachement of control plane instances to this load balancer
-* Create DNS entries for the cluster public and internal load balancer
-* Create a bootstrap node security group (and remove it when no longer required)
+* (TODO) Create the internal load balancer and manage attachement of control plane instances to this load balancer
+* (TODO) Create a bootstrap node security group (and remove it when no longer required)
 * Leverage Cluster API resources to create remanining infrastructure and bootstrap the cluster
 
 ## Prerequisites
 
-* [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html)
+* [OpenStackClient](https://docs.openstack.org/python-openstackclient/latest/)
 * [OpenShift CLI](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/)
 * [OpenShift Install CLI](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/)
-* AWS credentials
+* OpenStack credentials
 * An openshift pull secret (`pull-secret.txt`)
 * An OpenShift 4 cluster:
     * With the `TechPreviewNoUpgrade` feature set enabled
-    * Built with https://github.com/openshift/cluster-api-provider-aws/pull/475 and https://github.com/openshift/cluster-capi-operator/pull/127
+    * TODO: Add support for OpenStack and build https://github.com/openshift/cluster-capi-operator/pull/127
 
 ## Setting up the management/bootstrap cluster
 
@@ -41,7 +38,7 @@ This cluster is created using regular IPI workflows, though, it is expected that
 Using cluster bot, build a release image containing the required PRs:
 
 ```
-build 4.15,openshift/cluster-api-provider-aws#475,openshift/cluster-capi-operator#127
+build 4.15,openshift/cluster-capi-operator#127
 ```
 
 Once the image is built, extract the `openshift-install` binary from the image generated:
@@ -75,7 +72,7 @@ Once the installation is complete, you are ready to bootstrap the guest cluster.
 
 Once the management cluster is up and running, you can use the `create-cluster.sh` script to bootstrap the guest cluster.
 
-First, make sure that the `oc`, `aws` and `openshift-install` binaries are in your path, or use the `OC`, `AWS` and `OPENSHIFT_INSTALL` environment variables to point to the binaries.
+First, make sure that the `oc`, `openstack` and `openshift-install` binaries are in your path, or use the `OC`, `OPENSTACK` and `OPENSHIFT_INSTALL` environment variables to point to the binaries.
 
 Make sure your `KUBECONFIG` env is pointing to the management cluster kubeconfig.
 
