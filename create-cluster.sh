@@ -363,6 +363,12 @@ if [ "${cluster_bootstrapped}" != "True" ]; then
         fi
     done
 
+    while ! ${OC} get openshiftbootstrapconfig --namespace openshift-cluster-api-guests ${infra_id}-bootstrap 2>&1 > /dev/null; do
+        echo "Waiting for bootstrap bootstrapconfig to be created"
+        sleep 5
+    done
+
+    ${OC} patch openshiftbootstrapconfig --namespace openshift-cluster-api-guests ${infra_id}-bootstrap --subresource status --type merge -p '{"status":{"ready":true,"dataSecretName":"'${infra_id}-bootstrap-user-data'"}}'
 
     while ! ${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-bootstrap 2>&1 > /dev/null; do
         echo "Waiting for bootstrap machine to be created"
@@ -412,10 +418,13 @@ fi
 # BEGIN: Create master machines
 #
 
-for f in ${CLUSTER_DIR}/cluster-api-manifests/03_*.yaml; do
-    if ! ${OC} get -f $f > /dev/null 2>&1 ; then
-        ${OC} create -f $f
-    fi
+for node in {master-0,master-1,master-2}; do
+ while ! ${OC} get openshiftbootstrapconfig --namespace openshift-cluster-api-guests ${infra_id}-${node} 2>&1 > /dev/null; do
+        echo "Waiting for ${node} bootstrapconfig to be created"
+        sleep 5
+    done
+
+    ${OC} patch openshiftbootstrapconfig --namespace openshift-cluster-api-guests ${infra_id}-${node} --subresource status --type merge -p '{"status":{"ready":true,"dataSecretName":"'${infra_id}-master-user-data'"}}'
 done
 
 for node in {master-0,master-1,master-2}; do
@@ -489,11 +498,6 @@ done
 #
 # BEGIN: Destroy bootstrap node
 #
-
-bootstrap_machine="${CLUSTER_DIR}/cluster-api-manifests/02_bootstrap-machine.yaml"
-if ${OC} get -f ${bootstrap_machine} > /dev/null 2>&1 ; then
-    ${OC} delete -f ${bootstrap_machine}
-fi
 
 while [ ${OC} get -f ${bootstrap_machine} > /dev/null 2>&1 ]; do
     echo "Waiting for bootstrap machine to be deleted"

@@ -1,0 +1,20 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    cluster.x-k8s.io/aggregate-to-manager: "true"
+  name: capi-manager-role-openshift
+rules:
+- apiGroups:
+  - cluster.openshift.io
+  resources:
+  - openshiftcontrolplanes
+  - openshiftbootstrapconfigs
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - delete

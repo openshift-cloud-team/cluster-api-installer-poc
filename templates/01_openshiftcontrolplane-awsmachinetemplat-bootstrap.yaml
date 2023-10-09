@@ -1,0 +1,36 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSMachineTemplate
+metadata:
+  name: ${INFRA_ID}-bootstrap
+  namespace: openshift-cluster-api-guests
+  labels:
+    cluster.x-k8s.io/control-plane: ""
+spec:
+  template:
+    spec: 
+      ignition:
+        version: "3.4"
+      uncompressedUserData: true
+      iamInstanceProfile: ${INFRA_ID}-master-profile
+      instanceType: m6i.xlarge
+      ami:
+        id: ami-0e3844336e31a8ed0
+      subnet:
+        filters:
+        - name: tag:Name
+          values:
+          - ${INFRA_ID}-public-${REGION}a
+      additionalTags:
+        kubernetes.io/cluster/${INFRA_ID}: owned
+      additionalSecurityGroups:
+      - filters:
+        - name: tag:Name
+          values:
+          - ${INFRA_ID}-ocp-bootstrap
+      rootVolume:
+        size: 120
+        type: gp3
+        iops: 0
+        encrypted: true
+      sshKeyName: ""
+      publicIP: true

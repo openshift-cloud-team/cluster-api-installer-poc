@@ -1,0 +1,32 @@
+apiVersion: cluster.openshift.io/v1alpha1
+kind: OpenShiftControlPlane
+metadata:
+  name: ${INFRA_ID}
+  namespace: openshift-cluster-api-guests
+spec:
+  machineTemplate:
+    metadata:
+      labels:
+        cluster.x-k8s.io/control-plane: ""
+        cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: AWSMachineTemplate
+      name: ${INFRA_ID}-control-plane
+      namespace: openshift-cluster-api-guests
+  bootstrapMachineTemplate:
+    metadata:
+      labels:
+        cluster.x-k8s.io/control-plane: ""
+        cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: AWSMachineTemplate
+      name: ${INFRA_ID}-bootstrap
+      namespace: openshift-cluster-api-guests
+  installStateSecretRef:
+    name: ${INFRA_ID}-install-state
+  manifestsSelector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+      cluster.openshift.io/install-manifests: ""
