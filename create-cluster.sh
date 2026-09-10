@@ -3,30 +3,22 @@
 CLUSTER_DIR=$1
 OPENSHIFT_INSTALL=${OPENSHIFT_INSTALL:-openshift-install}
 SCRIPT_ROOT=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)
+# The management cluster is plain Kubernetes now, so kubectl rather than oc. OC is kept for the
+# guest cluster, where we do want the OpenShift client.
+KUBECTL=${KUBECTL:-kubectl}
 OC=${OC:-oc}
-AWS=${AWS:-aws}
 
-# Fixed:
-# - Install updated CRDs from PR
-# - Add assume role permissions to the IAM role for CAPA
-# - Cannot delete cluster
-# - Load balancer name for CAPI is not the same as MAPI
-# - When does the installer shut down the bootstrap node
-# - Invalid secret backend for CAPA
-# - Instance profiles profiles should be called profiles
-# - Security group name for MAPI is not the same as CAPI
-#   - SG names in machinesets/machines/controlplanemachineset need updates
-# - No SSH to bootstrap node by default
-# - Address bootstrap ignition feature gate issue
-# - See if https://github.com/kubernetes-sigs/cluster-api-provider-aws/pull/4359 will help with control plane SG rules
-# - Security group rules created by installer are not the same as created by CAPI
-#   - This is largely fixed now, but still not identical, needs a thorough review
-# - On delete, destroy LB first
-# - Should be able to determine if API is available not just bootstrap API, to allow reentrant bootstrap
-# - Should create kubeconfig in cluster to allow access to bootstrap API
+NAMESPACE=capi-guests
 
-# TODO: 
-# - Installer should delete resources created by CAPI tags (not all will have cluster tag - ref SG issue)
+source ${SCRIPT_ROOT}/lib/build-image.sh
+
+# TODO:
+# - Whether RHCOS on MOC reads OSProfile.CustomData at all is still unproven. We route around it
+#   by baking ignition into the images; if it turns out to work, the image build could be dropped
+#   in favour of one shared base image.
+# - Nothing scales the guest cluster: MachineAPI is disabled and there is no Azure Local CCM or
+#   CSI driver, so the worker image is built and uploaded but never consumed.
+# - CAPHCI leaks the vnet it creates. See destroy-cluster.sh.
 
 #
 # BEGIN: Setup of script prerequisites
@@ -47,108 +39,292 @@ if [ ! -f "${CLUSTER_DIR}/install-config.yaml" ] && [ ! -f "${CLUSTER_DIR}/.open
     exit 1
 fi
 
-if [ -f "${CLUSTER_DIR}/install-config.yaml" ]; then
-    ${OPENSHIFT_INSTALL} --dir ${CLUSTER_DIR} create manifests
+if [ ! -f "${CLUSTER_DIR}/azurelocal.env" ]; then
+    echo "Expected azurelocal.env to exist in ${CLUSTER_DIR}"
+    echo "Copy ${SCRIPT_ROOT}/azurelocal.env.example and fill it in"
+    exit 1
 fi
 
-if [ ! -f "${CLUSTER_DIR}/install-config.yaml" ] && [ -f "${CLUSTER_DIR}/.openshift_install_state.json" ] && [ ! -f "${CLUSTER_DIR}/metadata.json" ]; then
-    infra_id=$(jq -r '."*installconfig.ClusterID".InfraID' ${CLUSTER_DIR}/.openshift_install_state.json)
-    # At this point we have run create manifests but not yet create ignition-configs
-
-    # Update the security groups in the worker machinesets
-    for i in {"0","1","2"}; do
-        sed -i .bak "s/${infra_id}-worker-sg/${infra_id}-node\n          - filters:\n            - name: tag:Name\n              values:\n              - ${infra_id}-lb/" ${CLUSTER_DIR}/openshift/99_openshift-cluster-api_worker-machineset-${i}.yaml
-        rm ${CLUSTER_DIR}/openshift/99_openshift-cluster-api_worker-machineset-${i}.yaml.bak
-    done
-
-    # Update the security groups in the master machines
-    for i in {"0","1","2"}; do
-        sed -i .bak "s/${infra_id}-master-sg/${infra_id}-node\n      - filters:\n        - name: tag:Name\n          values:\n          - ${infra_id}-lb\n      - filters:\n        - name: tag:Name\n          values:\n          - ${infra_id}-controlplane/" ${CLUSTER_DIR}/openshift/99_openshift-cluster-api_master-machines-${i}.yaml
-        rm ${CLUSTER_DIR}/openshift/99_openshift-cluster-api_master-machines-${i}.yaml.bak
-    done
-
-    # Update the security group in the control plane machine set
-    sed -i .bak "s/${infra_id}-master-sg/${infra_id}-node\n            - filters:\n              - name: tag:Name\n                values:\n                - ${infra_id}-lb\n            - filters:\n              - name: tag:Name\n                values:\n                - ${infra_id}-controlplane/" ${CLUSTER_DIR}/openshift/99_openshift-machine-api_master-control-plane-machine-set.yaml
-    rm ${CLUSTER_DIR}/openshift/99_openshift-machine-api_master-control-plane-machine-set.yaml.bak
-
-    ${OPENSHIFT_INSTALL} --dir ${CLUSTER_DIR} create ignition-configs
-fi
+source ${CLUSTER_DIR}/azurelocal.env
 
 #
 # END: Setup of script prerequisites
 #
 
 #
+# BEGIN: Preflight checks
+#
+# CAPHCI fails late and quietly for most of these, so check them up front and print the remedy.
+#
+
+preflight_failed=0
+
+preflight_error() {
+    echo "PREFLIGHT: $1"
+    echo "           $2"
+    preflight_failed=1
+}
+
+for var in RESOURCE_GROUP LOCATION VNET_NAME VNET_RESOURCE_GROUP STORAGE_CONTAINER \
+           SSH_PUBLIC_KEY_B64 CONTROL_PLANE_VM_SIZE BOOTSTRAP_VM_SIZE API_VIP \
+           KUBERNETES_VERSION CAPI_CORE_VERSION; do
+    if [ -z "${!var}" ]; then
+        preflight_error "${var} is not set in ${CLUSTER_DIR}/azurelocal.env" \
+                        "See ${SCRIPT_ROOT}/azurelocal.env.example"
+    fi
+done
+
+# base64.StdEncoding.DecodeString() is applied to sshPublicKey by the reconciler.
+if [ -n "${SSH_PUBLIC_KEY_B64}" ] && ! echo "${SSH_PUBLIC_KEY_B64}" | base64 -d > /dev/null 2>&1; then
+    preflight_error "SSH_PUBLIC_KEY_B64 is not valid base64" \
+                    "Set it with: SSH_PUBLIC_KEY_B64=\"\$(base64 -w0 < ~/.ssh/id_ed25519.pub)\""
+fi
+
+# isAvailabilityZoneSupported() string-matches spec.location against this list, and the reconciler
+# then dereferences spec.availabilityZone.Enabled without a nil check. Our machines omit
+# availabilityZone, so a match panics the controller.
+for zone_location in centralus eastus eastus2 westus2 francecentral northeurope uksouth westeurope japaneast southeastasia; do
+    if [ "${LOCATION}" == "${zone_location}" ]; then
+        preflight_error "LOCATION '${LOCATION}' collides with a hardcoded availability zone location" \
+                        "Rename the MOC location; this crashes the CAPHCI controller on a nil pointer"
+    fi
+done
+
+# CAPHCI authenticates to the MOC cloudagent with a single global secret, created out of band with
+# 'mocctl security identity create'. There is no identity CRD to fall back on.
+if ! ${KUBECTL} get secret -n default caphlogintoken > /dev/null 2>&1; then
+    preflight_error "Secret default/caphlogintoken is missing on the management cluster" \
+                    "Create a MOC identity with 'mocctl security identity create' and load the token"
+fi
+
+if ! ${KUBECTL} get crd azurestackhciclusters.infrastructure.cluster.x-k8s.io > /dev/null 2>&1; then
+    preflight_error "CAPHCI CRDs are not installed on the management cluster" \
+                    "Install cluster-api-provider-azurestackhci; see README.md"
+else
+    storage_version=$(${KUBECTL} get crd azurestackhciclusters.infrastructure.cluster.x-k8s.io \
+        -o json | jq -r '.spec.versions[] | select(.storage == true) | .name')
+    if [ "${storage_version}" != "v1beta2" ]; then
+        preflight_error "CAPHCI CRD storage version is '${storage_version}', expected v1beta2" \
+                        "The templates are written against v1beta2, which all ten controllers import"
+    fi
+fi
+
+for tool in ${CONTAINER_RUNTIME:-podman} ${QEMU_IMG:-qemu-img} ${MOCCTL:-mocctl} jq envsubst curl; do
+    if ! command -v ${tool} > /dev/null 2>&1; then
+        preflight_error "${tool} is not on PATH" \
+                        "Required to build and upload the RHCOS gallery images"
+    fi
+done
+
+if [ ${preflight_failed} -ne 0 ]; then
+    echo
+    echo "Preflight checks failed; fix the above and re-run."
+    exit 1
+fi
+
+#
+# END: Preflight checks
+#
+
+# wait_for_machine <name>
+#
+# Waits for an AzureStackHCIMachine's virtual machine to come up.
+#
+# The AWS version polled .spec.instanceID and then .status.instanceState == "running". CAPHCI has
+# no instance ID on the spec, and its VMState enum is
+# Creating|Updating|Succeeded|Migrating|Failed|Deleting -- there is no "Running", so Succeeded is
+# the terminal healthy state.
+#
+# Unlike the AWS version this fails fast rather than looping forever. PathNotFound in particular
+# means the gallery image is missing, which is easy to hit while iterating on the image build.
+wait_for_machine() {
+    local name=$1
+    local json state failure
+
+    while ! ${KUBECTL} get azurestackhcimachine --namespace ${NAMESPACE} ${name} > /dev/null 2>&1; do
+        echo "Waiting for ${name} to be created"
+        sleep 5
+    done
+
+    while true; do
+        json=$(${KUBECTL} get azurestackhcimachine --namespace ${NAMESPACE} ${name} -o json)
+        state=$(echo "${json}" | jq -r '.status.vmState // "Pending"')
+
+        if [ "${state}" == "Succeeded" ]; then
+            echo "${name} is running"
+            return 0
+        fi
+
+        if [ "${state}" == "Failed" ]; then
+            echo "${name} entered the Failed VM state"
+            echo "${json}" | jq -r '.status.conditions[]? | select(.status == "False") | "  \(.reason): \(.message)"'
+            return 1
+        fi
+
+        failure=$(echo "${json}" | jq -r '
+            .status.conditions[]?
+            | select(.type == "VMRunning" and .status == "False")
+            | select(["VMProvisionFailed", "OutOfMemory", "OutOfCapacity", "PathNotFound", "MOCUnreachable"] | index(.reason))
+            | "\(.reason): \(.message)"')
+        if [ -n "${failure}" ]; then
+            echo "${name} failed to provision -- ${failure}"
+            case "${failure}" in
+                PathNotFound*)
+                    echo "  PathNotFound means the MOC gallery image was not found; check that the"
+                    echo "  image referenced by spec.image.name was uploaded." ;;
+                MOCUnreachable*)
+                    echo "  Check AZURESTACKHCI_CLOUDAGENT_FQDN on the CAPHCI controller and the"
+                    echo "  default/caphlogintoken secret." ;;
+            esac
+            return 1
+        fi
+
+        echo "Waiting for ${name} to be running (VM state: ${state})"
+        sleep 5
+    done
+}
+
+#
+# BEGIN: Generate manifests and ignition
+#
+
+if [ -f "${CLUSTER_DIR}/install-config.yaml" ]; then
+    ${OPENSHIFT_INSTALL} --dir ${CLUSTER_DIR} create manifests || exit 1
+fi
+
+if [ ! -f "${CLUSTER_DIR}/install-config.yaml" ] && [ -f "${CLUSTER_DIR}/.openshift_install_state.json" ] && [ ! -f "${CLUSTER_DIR}/metadata.json" ]; then
+    # The AWS version of this script patched security group references into the generated Machine
+    # API manifests here. On platform: baremetal with the MachineAPI capability disabled, the
+    # installer generates no master Machines, no worker MachineSets, no BareMetalHosts and no
+    # ControlPlaneMachineSet at all -- pkg/asset/machines/{master,worker}.go break out early on
+    # !enabledCaps.Has(ClusterVersionCapabilityMachineAPI) -- so there is nothing to patch.
+    #
+    # If those files do appear, the capability was not actually disabled and the rest of this
+    # script is built on a false assumption.
+    if compgen -G "${CLUSTER_DIR}/openshift/99_openshift-cluster-api_*" > /dev/null; then
+        echo "Machine API manifests were generated, which means the MachineAPI capability is enabled."
+        echo "Set the following in install-config.yaml and start from a clean directory:"
+        echo "  capabilities:"
+        echo "    baselineCapabilitySet: None"
+        echo "    additionalEnabledCapabilities: [...]   # without MachineAPI"
+        exit 1
+    fi
+
+    ${OPENSHIFT_INSTALL} --dir ${CLUSTER_DIR} create ignition-configs || exit 1
+fi
+
+infra_id=$(jq -r '.infraID' ${CLUSTER_DIR}/metadata.json)
+
+bootstrap_image_name=${infra_id}-bootstrap
+master_image_name=${infra_id}-master
+worker_image_name=${infra_id}-worker
+
+#
+# END: Generate manifests and ignition
+#
+
+#
+# BEGIN: Build and upload the RHCOS gallery images
+#
+
+image_dir=${CLUSTER_DIR}/images
+cache_dir=${RHCOS_CACHE_DIR:-${HOME}/.cache/cluster-api-installer-poc}
+mkdir -p ${image_dir}
+
+# bootstrap.ign always carries the ironic/metal3 units on the baremetal platform, and
+# master-bmh-update.service deadlocks without the BareMetalHost CRD, keeping the API VIP pinned to
+# the bootstrap node. Strip them before the image is built.
+strip_ironic_units ${CLUSTER_DIR}/bootstrap.ign ${image_dir}/bootstrap-stripped.ign || exit 1
+
+base_image=$(fetch_metal_artifact ${cache_dir}) || exit 1
+
+# With DHCP (the default) all three masters share one image. With STATIC_NETWORK_KARGS set they
+# cannot, because the address and hostname are baked in per node -- five images instead of three.
+if [ ${#STATIC_NETWORK_KARGS[@]} -eq 0 ]; then
+    build_image ${image_dir} ${base_image} ${image_dir}/bootstrap-stripped.ign \
+        ${image_dir}/${bootstrap_image_name}.vhdx || exit 1
+    build_image ${image_dir} ${base_image} ${CLUSTER_DIR}/master.ign \
+        ${image_dir}/${master_image_name}.vhdx || exit 1
+    build_image ${image_dir} ${base_image} ${CLUSTER_DIR}/worker.ign \
+        ${image_dir}/${worker_image_name}.vhdx || exit 1
+
+    upload_gallery_image ${bootstrap_image_name} ${image_dir}/${bootstrap_image_name}.vhdx || exit 1
+    upload_gallery_image ${master_image_name} ${image_dir}/${master_image_name}.vhdx || exit 1
+    upload_gallery_image ${worker_image_name} ${image_dir}/${worker_image_name}.vhdx || exit 1
+else
+    nameserver_karg=""
+    [ -n "${STATIC_NAMESERVER}" ] && nameserver_karg="nameserver=${STATIC_NAMESERVER}"
+
+    build_image ${image_dir} ${base_image} ${image_dir}/bootstrap-stripped.ign \
+        ${image_dir}/${bootstrap_image_name}.vhdx "${STATIC_NETWORK_KARGS[0]}" "${nameserver_karg}" || exit 1
+    upload_gallery_image ${bootstrap_image_name} ${image_dir}/${bootstrap_image_name}.vhdx || exit 1
+
+    for i in 0 1 2; do
+        build_image ${image_dir} ${base_image} ${CLUSTER_DIR}/master.ign \
+            ${image_dir}/${master_image_name}-${i}.vhdx \
+            "${STATIC_NETWORK_KARGS[$((i + 1))]}" "${nameserver_karg}" || exit 1
+        upload_gallery_image ${master_image_name}-${i} ${image_dir}/${master_image_name}-${i}.vhdx || exit 1
+    done
+
+    # Per-node images mean the shared ${MASTER_IMAGE_NAME} no longer applies; the master manifests
+    # need patching to reference ${master_image_name}-<i>.
+    echo "STATIC_NETWORK_KARGS is set: patch the master AzureStackHCIMachine manifests to use the"
+    echo "per-node images ${master_image_name}-{0,1,2} before continuing."
+fi
+
+#
+# END: Build and upload the RHCOS gallery images
+#
+
+#
 # BEGIN: Create Cluster API manifests
 #
 
-infra_id=$(jq -r '.infraID' ${CLUSTER_DIR}/metadata.json)
-region=$(jq -r '.aws.region' ${CLUSTER_DIR}/metadata.json)
-aws_account_id=$(${AWS} sts get-caller-identity --query Account --output text)
-
 mkdir -p ${CLUSTER_DIR}/cluster-api-manifests
 
+substitutions='${INFRA_ID} ${LOCATION} ${RESOURCE_GROUP} ${VNET_NAME} ${VNET_RESOURCE_GROUP}'
+substitutions+=' ${SSH_PUBLIC_KEY_B64} ${STORAGE_CONTAINER} ${CONTROL_PLANE_VM_SIZE}'
+substitutions+=' ${BOOTSTRAP_VM_SIZE} ${API_VIP} ${KUBERNETES_VERSION} ${CAPI_CORE_VERSION}'
+substitutions+=' ${BOOTSTRAP_IMAGE_NAME} ${MASTER_IMAGE_NAME} ${WORKER_IMAGE_NAME}'
+
 for f in ${SCRIPT_ROOT}/templates/*.yaml; do
-    REGION=${region} INFRA_ID=${infra_id} AWS_ACCOUNT_ID=${aws_account_id} envsubst '${REGION} ${INFRA_ID} ${AWS_ACCOUNT_ID}'  < $f > ${CLUSTER_DIR}/cluster-api-manifests/$(basename $f)
+    INFRA_ID=${infra_id} \
+    LOCATION=${LOCATION} \
+    RESOURCE_GROUP=${RESOURCE_GROUP} \
+    VNET_NAME=${VNET_NAME} \
+    VNET_RESOURCE_GROUP=${VNET_RESOURCE_GROUP} \
+    SSH_PUBLIC_KEY_B64=${SSH_PUBLIC_KEY_B64} \
+    STORAGE_CONTAINER=${STORAGE_CONTAINER} \
+    CONTROL_PLANE_VM_SIZE=${CONTROL_PLANE_VM_SIZE} \
+    BOOTSTRAP_VM_SIZE=${BOOTSTRAP_VM_SIZE} \
+    API_VIP=${API_VIP} \
+    KUBERNETES_VERSION=${KUBERNETES_VERSION} \
+    CAPI_CORE_VERSION=${CAPI_CORE_VERSION} \
+    BOOTSTRAP_IMAGE_NAME=${bootstrap_image_name} \
+    MASTER_IMAGE_NAME=${master_image_name} \
+    WORKER_IMAGE_NAME=${worker_image_name} \
+    envsubst "${substitutions}" < $f > ${CLUSTER_DIR}/cluster-api-manifests/$(basename $f)
 done
 
+# CAPI requires bootstrap data to exist before an infrastructure machine is provisioned, and
+# MachineScope.GetBootstrapData() errors if the secret or its "value" key is missing. Nothing reads
+# the contents: the real ignition is in the gallery image. Keeping a placeholder here rather than
+# the real config also keeps the cluster root CA private key and the pull secret off the
+# management cluster.
 for role in {bootstrap,master,worker}; do
-    # Note: when applied to the clustser, we add an owner reference to these secrets to link them to the Cluster object
-    ${OC} create secret generic --dry-run=client --namespace openshift-cluster-api-guests ${infra_id}-${role}-user-data  --from-literal format=ignition --from-file=value=${CLUSTER_DIR}/${role}.ign -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_${role}-user-data-secret.yaml 
+    ${KUBECTL} create secret generic --dry-run=client --namespace ${NAMESPACE} \
+        ${infra_id}-${role}-user-data \
+        --from-literal value="# placeholder: the ${role} ignition config is baked into the gallery image" \
+        -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_${role}-user-data-secret.yaml
 done
 
-# Cluster API expects a kubeconfig to be able to talk to the guest cluster
-${OC} create secret generic --dry-run=client --namespace openshift-cluster-api-guests ${infra_id}-kubeconfig --from-file=value=${CLUSTER_DIR}/auth/kubeconfig -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_kubeconfig-secret.yaml
+# Cluster API expects a kubeconfig to be able to talk to the guest cluster.
+${KUBECTL} create secret generic --dry-run=client --namespace ${NAMESPACE} \
+    ${infra_id}-kubeconfig --from-file=value=${CLUSTER_DIR}/auth/kubeconfig \
+    -o yaml > ${CLUSTER_DIR}/cluster-api-manifests/02_kubeconfig-secret.yaml
 
 #
 # END: Create Cluster API manifests
-#
-
-#
-# BEGIN: Create IAM roles
-#
-
-iam_role_name=${infra_id}-capa-installer
-
-if ! ${AWS} iam get-role --role-name "${iam_role_name}" 2>&1 > /dev/null ; then
-    echo "Creating IAM role ${iam_role_name}"
-    ${AWS} iam create-role --role-name ${iam_role_name} --assume-role-policy-document "$(AWS_ACCOUNT_ID=${aws_account_id} envsubst '${AWS_ACCOUNT_ID}' < ${SCRIPT_ROOT}/capa-installer-role-iam-trust-policy.json)" --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-fi
-
-if ! ${AWS} iam get-role-policy --role-name "${iam_role_name}" --policy-name "${iam_role_name}" 2>&1 > /dev/null ; then
-    echo "Creating IAM role policy ${iam_role_name}"
-    ${AWS} iam put-role-policy --role-name ${iam_role_name} --policy-name ${iam_role_name} --policy-document "$(cat ${SCRIPT_ROOT}/capa-installer-role-iam-policy.json)"
-fi
-
-for role in {master,worker}; do
-    iam_machine_role_name=${infra_id}-${role}-role
-    iam_machine_profile_name=${infra_id}-${role}-profile
-
-    if ! ${AWS} iam get-role --role-name "${iam_machine_role_name}" 2>&1 > /dev/null ; then
-        echo "Creating IAM role ${iam_machine_role_name}"
-        ${AWS} iam create-role --role-name ${iam_machine_role_name} --assume-role-policy-document "$(cat ${SCRIPT_ROOT}/machine-role-iam-trust-policy.json)" --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-    fi
-
-    if ! ${AWS} iam get-role-policy --role-name "${iam_machine_role_name}" --policy-name "${iam_machine_role_name}" 2>&1 > /dev/null ; then
-        echo "Creating IAM role policy ${iam_machine_role_name}"
-        ${AWS} iam put-role-policy --role-name ${iam_machine_role_name} --policy-name ${iam_machine_role_name} --policy-document "$(cat ${SCRIPT_ROOT}/${role}-role-iam-policy.json)"
-    fi
-
-    if ! ${AWS} iam get-instance-profile --instance-profile-name "${iam_machine_profile_name}" 2>&1 > /dev/null ; then
-        echo "Creating IAM instance profile ${iam_machine_profile_name}"
-        ${AWS} iam create-instance-profile --instance-profile-name ${iam_machine_profile_name} --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-    fi
-
-    instance_profile_roles=$(${AWS} iam get-instance-profile --instance-profile-name "${iam_machine_profile_name}" | jq -r '.InstanceProfile.Roles[]')
-
-    if [ -z "${instance_profile_roles}" ] ; then
-        echo "Adding IAM role ${iam_machine_role_name} to instance profile ${iam_machine_profile_name}"
-        ${AWS} iam add-role-to-instance-profile --instance-profile-name ${iam_machine_profile_name} --role-name ${iam_machine_role_name}
-    fi
-done
-
-#
-# END: Create IAM roles
 #
 
 #
@@ -156,252 +332,69 @@ done
 #
 
 for f in ${CLUSTER_DIR}/cluster-api-manifests/00_*.yaml; do
-    if ! ${OC} get -f $f > /dev/null 2>&1 ; then
-        ${OC} create -f $f
+    if ! ${KUBECTL} get -f $f > /dev/null 2>&1 ; then
+        ${KUBECTL} create -f $f
     fi
 done
 
 for f in ${CLUSTER_DIR}/cluster-api-manifests/01_*.yaml; do
-    if ! ${OC} get -f $f > /dev/null 2>&1 ; then
-        ${OC} create -f $f
+    if ! ${KUBECTL} get -f $f > /dev/null 2>&1 ; then
+        ${KUBECTL} create -f $f
     fi
 done
 
-while [ "$(${OC} get awscluster --namespace openshift-cluster-api-guests ${infra_id} -o json | jq .status.ready)" != 'true' ]; do
-    echo "Waiting for AWS infrastructure cluster to be ready"
+# Note this is .status.initialization.provisioned, not .status.ready. AzureStackHCIClusterStatus
+# dropped Ready in v1beta2 in favour of the CAPI initialization contract.
+while [ "$(${KUBECTL} get azurestackhcicluster --namespace ${NAMESPACE} ${infra_id} -o json | jq -r '.status.initialization.provisioned')" != 'true' ]; do
+    cluster_failure=$(${KUBECTL} get azurestackhcicluster --namespace ${NAMESPACE} ${infra_id} -o json |
+        jq -r '.status.conditions[]? | select(.type == "NetworkInfrastructureReady" and .status == "False") | .message')
+    if [ -n "${cluster_failure}" ]; then
+        echo "AzureStackHCICluster reconciliation is failing: ${cluster_failure}"
+    fi
+
+    echo "Waiting for AzureStackHCI infrastructure cluster to be ready"
     sleep 5
 done
 
 #
 # END: Apply cluster manifests to cluster
 #
-
 #
-# BEGIN: Create internal load balancer
+# The AWS version built an internal NLB with target groups for 6443 and 22623, registered each
+# instance into it, and created Route53 records for api and api-int. None of that is ported.
 #
-
-subnet_ids=$(${OC} get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.spec.network.subnets[]| select(.isPublic == false) | .resourceID' | xargs)
-vpc_id=$(${OC} get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.spec.network.vpc.id')
-
-internal_lb_name=${infra_id}-int
-internal_lb_arn=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${internal_lb_name} | jq -r '.LoadBalancers[0].LoadBalancerArn')
-
-if [ -z ${internal_lb_arn} ] ; then
-    echo "Creating internal load balancer ${internal_lb_name}"
-    ${AWS} elbv2 create-load-balancer --region ${region} --name ${internal_lb_name} --subnets ${subnet_ids} --type network --scheme internal --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-    internal_lb_arn=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${internal_lb_name} | jq -r '.LoadBalancers[0].LoadBalancerArn')
-fi
-
-api_target_name=${infra_id}-aint
-api_target_arn=$(${AWS} elbv2 describe-target-groups --region ${region} --name ${api_target_name} | jq -r '.TargetGroups[0].TargetGroupArn')
-
-if [ -z ${api_target_arn} ] ; then
-    echo "Creating target group ${api_target_name}"
-    ${AWS} elbv2 create-target-group --region ${region} --name ${api_target_name} --protocol TCP --port 6443 --vpc-id ${vpc_id} --target-type instance --tags Key=kubernetes.io/cluster/${infra_id},Value=owned --health-check-port 6443 --health-check-path /readyz --health-check-protocol HTTPS
-    api_target_arn=$(${AWS} elbv2 describe-target-groups --region ${region} --name ${api_target_name} | jq -r '.TargetGroups[0].TargetGroupArn')
-fi
-
-mcs_target_name=${infra_id}-sint
-mcs_target_arn=$(${AWS} elbv2 describe-target-groups --region ${region} --name ${mcs_target_name} | jq -r '.TargetGroups[0].TargetGroupArn')
-
-if [ -z ${mcs_target_arn} ] ; then
-    echo "Creating target group ${mcs_target_name}"
-    ${AWS} elbv2 create-target-group --region ${region} --name ${mcs_target_name} --protocol TCP --port 22623 --vpc-id ${vpc_id} --target-type instance --tags Key=kubernetes.io/cluster/${infra_id},Value=owned --health-check-port 22623 --health-check-path /healthz --health-check-protocol HTTPS
-    mcs_target_arn=$(${AWS} elbv2 describe-target-groups --region ${region} --name ${mcs_target_name} | jq -r '.TargetGroups[0].TargetGroupArn')
-fi
-
-listeners=$(${AWS} elbv2 describe-listeners --region ${region} --load-balancer-arn ${internal_lb_arn} | jq -r '.Listeners[]')
-
-if [ -z "$(echo ${listeners} | jq 'select(.Port == 6443)')" ]; then
-    echo "Creating listener for port 6443"
-    ${AWS} elbv2 create-listener --region ${region} --load-balancer-arn ${internal_lb_arn} --protocol TCP --port 6443 --default-actions Type=forward,TargetGroupArn=${api_target_arn} --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-fi
-
-if [ -z "$(echo ${listeners} | jq 'select(.Port == 22623)')" ]; then
-    echo "Creating listener for port 22623"
-    ${AWS} elbv2 create-listener --region ${region} --load-balancer-arn ${internal_lb_arn} --protocol TCP --port 22623 --default-actions Type=forward,TargetGroupArn=${mcs_target_arn} --tags Key=kubernetes.io/cluster/${infra_id},Value=owned
-fi
-
+# On platform: baremetal the machine-config-operator's onPremPlatform() path deploys keepalived,
+# haproxy and coredns as static pods on the nodes themselves, and those serve the API VIP,
+# api-int, MCS on 22623 and the ingress VIP from inside the cluster. That also sidesteps CAPHCI
+# having no static IP support: the VIP floats onto whichever node holds it rather than us needing
+# to know node addresses in advance to register them as backends.
 #
-# END: Create internal load balancer
-#
-
-#
-# BEGIN: Create DNS entries for external and internal load balancers
-#
-
-api_server_public_lb_name=$(${OC} get awscluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.spec.controlPlaneLoadBalancer.name')
-api_server_public_lb_arn=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${api_server_public_lb_name} | jq -r '.LoadBalancers[0]')
-api_server_public_lb_dns_name=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${api_server_public_lb_name} | jq -r '.LoadBalancers[0].DNSName')
-api_server_public_lb_zone_id=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${api_server_public_lb_name} | jq -r '.LoadBalancers[0].CanonicalHostedZoneId')
-
-cluster_domain=$(jq -r '.aws.clusterDomain' ${CLUSTER_DIR}/metadata.json)
-base_domain=$(echo ${cluster_domain} | cut -d . -f 2-)
-
-public_hosted_zone_id=$(${AWS} route53 list-hosted-zones-by-name --region ${region} --dns-name ${base_domain} | jq -r ".HostedZones[] | select(.Name == \"${base_domain}.\") | .Id")
-existing_public_records=$(${AWS} route53 list-resource-record-sets --hosted-zone-id ${public_hosted_zone_id} --query "ResourceRecordSets[?Name == 'api.${cluster_domain}.']")
-
-if [ "${existing_public_records}" == "[]" ] ; then 
-    echo "Creating DNS entry for api.${cluster_domain}"
-    insert_public_records=$(cat << EOF
-{
-    "Comment": "Insert public records for ${infra_id}",
-    "Changes": [
-        {
-            "Action": "CREATE",
-            "ResourceRecordSet": {
-                "Name": "api.${cluster_domain}",
-                "Type": "A",
-                "AliasTarget": {
-                    "HostedZoneId": "${api_server_public_lb_zone_id}",
-                    "DNSName": "${api_server_public_lb_dns_name}",
-                    "EvaluateTargetHealth": false
-                }
-            }
-        }
-    ]
-}
-EOF
-)
-    ${AWS} route53 change-resource-record-sets --hosted-zone-id ${public_hosted_zone_id} --change-batch "${insert_public_records}"
-fi
-
-api_server_internal_lb_dns_name=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${internal_lb_name} | jq -r '.LoadBalancers[0].DNSName')
-api_server_internal_lb_zone_id=$(${AWS} elbv2 describe-load-balancers --region ${region} --names ${internal_lb_name} | jq -r '.LoadBalancers[0].CanonicalHostedZoneId')
-
-internal_hosted_zone_id=$(${AWS} route53 list-hosted-zones-by-name --region ${region} --dns-name ${cluster_domain} | jq -r ".HostedZones[] | select(.Name == \"${cluster_domain}.\") | .Id")
-
-if [ -z ${internal_hosted_zone_id} ]; then
-    echo "Creating hosted zone for ${cluster_domain}"
-    ${AWS} route53 create-hosted-zone --region ${region} --name ${cluster_domain} --caller-reference $(date +%s) --hosted-zone-config Comment="Hosted zone for ${cluster_domain}",PrivateZone=true --vpc VPCRegion=${region},VPCId=${vpc_id}
-    internal_hosted_zone_id=$(${AWS} route53 list-hosted-zones-by-name --region ${region} --dns-name ${cluster_domain} | jq -r ".HostedZones[] | select(.Name == \"${cluster_domain}.\") | .Id")
-
-    ${AWS} route53 change-tags-for-resource --resource-type hostedzone --resource-id $(echo ${internal_hosted_zone_id} | cut -d/ -f 3) --add-tags Key=kubernetes.io/cluster/${infra_id},Value=owned Key=Name,Value=${infra_id}-int
-fi
-
-existing_internal_records=$(${AWS} route53 list-resource-record-sets --hosted-zone-id ${internal_hosted_zone_id} --query "ResourceRecordSets[?Name == 'api.${cluster_domain}.']")
-if [ "${existing_internal_records}" == "[]" ] ; then 
-    echo "Creating internal DNS entry for api.${cluster_domain} and api-int.${cluster_domain}"
-    insert_internal_records=$(cat << EOF
-{
-    "Comment": "Insert internal records for ${infra_id}",
-    "Changes": [
-        {
-            "Action": "CREATE",
-            "ResourceRecordSet": {
-                "Name": "api.${cluster_domain}",
-                "Type": "A",
-                "AliasTarget": {
-                    "HostedZoneId": "${api_server_internal_lb_zone_id}",
-                    "DNSName": "${api_server_internal_lb_dns_name}",
-                    "EvaluateTargetHealth": false
-                }
-            }
-        },
-        {
-            "Action": "CREATE",
-            "ResourceRecordSet": {
-                "Name": "api-int.${cluster_domain}",
-                "Type": "A",
-                "AliasTarget": {
-                    "HostedZoneId": "${api_server_internal_lb_zone_id}",
-                    "DNSName": "${api_server_internal_lb_dns_name}",
-                    "EvaluateTargetHealth": false
-                }
-            }
-        }
-    ]
-}
-EOF
-)
-    ${AWS} route53 change-resource-record-sets --hosted-zone-id ${internal_hosted_zone_id} --change-batch "${insert_internal_records}"
-fi
-
-#
-# END: Create DNS entries for external and internal load balancers
-#
-
-#
-# BEGIN: Create required security groups and rules
-#
-
-if [ "$(${AWS} ec2 describe-security-groups --region ${region} --filter Name=\"group-name\",Values=\"${infra_id}-ocp-bootstrap\" | jq -r '.SecurityGroups[]')" == "" ] ; then
-    echo "Creating security group ${infra_id}-ocp-bootstrap"
-    ${AWS} ec2 create-security-group --region ${region} --group-name ${infra_id}-ocp-bootstrap --description "Security group for ${infra_id} bootstrap" --vpc-id ${vpc_id} --tag-specification "ResourceType=security-group,Tags=[{Key=\"Name\",Value=\"${infra_id}-ocp-bootstrap\"},{Key=\"sigs.k8s.io/cluster-api-provider-aws/cluster/${infra_id}\",Value=\"owned\"}]"
-fi
-
-bootstrap_sg_id=$(${AWS} ec2 describe-security-groups --region ${region} --filter Name="group-name",Values="${infra_id}-ocp-bootstrap" | jq -r '.SecurityGroups[0].GroupId')
-bootstrap_sg_rules=$(${AWS} ec2 describe-security-group-rules --region ${region} --filter Name="group-id",Values="${bootstrap_sg_id}" | jq -r '.SecurityGroupRules[]')
-
-if [ -z "$(echo ${bootstrap_sg_rules} | jq 'select(.IpProtocol == "tcp")| select(.FromPort == 22) | select(.ToPort == 22) | select(.CidrIpv4 == "0.0.0.0/0")')" ]; then
-    echo "Creating bootstrap security group rule for port 22"
-    ${AWS} ec2 authorize-security-group-ingress --region ${region} --group-id ${bootstrap_sg_id} --protocol tcp --port 22 --cidr 0.0.0.0/0
-fi
-
-#
-# END: Create required security group rules
+# DNS for api.<cluster-domain> and *.apps.<cluster-domain> is an operator prerequisite; CAPHCI has
+# no DNS integration to replace Route53 with.
 #
 
 #
 # BEGIN: Create bootstrap machine
 #
 
-cluster_bootstrapped=$(${OC} get cluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.status.conditions[] | select(.type == "ControlPlaneInitialized")| .status')
+cluster_bootstrapped=$(${KUBECTL} get cluster -n ${NAMESPACE} ${infra_id} -o json | jq -r '.status.conditions[]? | select(.type == "ControlPlaneInitialized")| .status')
 
 if [ "${cluster_bootstrapped}" != "True" ]; then
     for f in ${CLUSTER_DIR}/cluster-api-manifests/02_*.yaml; do
-        if ! ${OC} get -f $f > /dev/null 2>&1 ; then
-            ${OC} create -f $f
+        if ! ${KUBECTL} get -f $f > /dev/null 2>&1 ; then
+            ${KUBECTL} create -f $f
         fi
     done
 
-    cluster_uid="$(${OC} get cluster -n openshift-cluster-api-guests ${infra_id} -o json | jq -r '.metadata.uid')"
+    cluster_uid="$(${KUBECTL} get cluster -n ${NAMESPACE} ${infra_id} -o json | jq -r '.metadata.uid')"
     for role in {bootstrap,master,worker}; do
-        if [ "$(${OC} get secret --namespace openshift-cluster-api-guests ${infra_id}-${role}-user-data -o json | jq '.metadata.ownerReferences')" == 'null' ]; then
+        if [ "$(${KUBECTL} get secret --namespace ${NAMESPACE} ${infra_id}-${role}-user-data -o json | jq '.metadata.ownerReferences')" == 'null' ]; then
             # Patch the Cluster as an owner so that we can delete the secrets when the cluster is deleted
-            ${OC} patch secret --namespace openshift-cluster-api-guests ${infra_id}-${role}-user-data -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"cluster.x-k8s.io/v1beta1\",\"blockOwnerDeletion\":true,\"controller\":true,\"kind\":\"Cluster\",\"name\":\"${infra_id}\",\"uid\":\"${cluster_uid}\"}]}}"
+            ${KUBECTL} patch secret --namespace ${NAMESPACE} ${infra_id}-${role}-user-data -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"cluster.x-k8s.io/${CAPI_CORE_VERSION}\",\"blockOwnerDeletion\":true,\"controller\":true,\"kind\":\"Cluster\",\"name\":\"${infra_id}\",\"uid\":\"${cluster_uid}\"}]}}"
         fi
     done
 
-
-    while ! ${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-bootstrap 2>&1 > /dev/null; do
-        echo "Waiting for bootstrap machine to be created"
-        sleep 5
-    done
-
-    while [ $(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-bootstrap -o json | jq -r '.spec.instanceID') == "null" ]; do
-        echo "Waiting for bootstrap node to be provisioned"
-        sleep 5
-    done
-
-    while [ $(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-bootstrap -o json | jq -r '.status.instanceState') != "running" ]; do
-        echo "Waiting for bootstrap node to be running"
-        sleep 5
-    done
-
-    bootstrap_id=$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-bootstrap -o json | jq -r '.spec.instanceID')
-
-    int_api_boostrap_target_health=$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${api_target_arn} --targets "Id=${bootstrap_id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State')
-    if [ "${int_api_boostrap_target_health}" == "unused" ]  ; then
-        echo "Registering bootstrap node to internal load balancer (API)"
-        ${AWS} elbv2 register-targets --region ${region} --target-group-arn ${api_target_arn} --targets "Id=${bootstrap_id}"
-    fi
-
-    int_mcs_boostrap_target_health=$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${bootstrap_id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State')
-    if [ "${int_mcs_boostrap_target_health}" == "unused" ]  ; then
-        echo "Registering bootstrap node to internal load balancer (MCS)"
-        ${AWS} elbv2 register-targets --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${bootstrap_id}"
-    fi
-
-    while [ "$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${api_target_arn} | jq -r '.TargetHealthDescriptions[].TargetHealth.State | select(. == "healthy")' | uniq)" != "healthy" ]; do
-        echo "Waiting for bootstrap API to be ready"
-        sleep 5
-    done
-
-    while [ "$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${mcs_target_arn} | jq -r '.TargetHealthDescriptions[].TargetHealth.State | select(. == "healthy")' | uniq)" != "healthy" ]; do
-        echo "Waiting for bootstrap MCS to be ready"
-        sleep 5
-    done
+    wait_for_machine ${infra_id}-bootstrap || exit 1
 fi
 
 #
@@ -413,41 +406,13 @@ fi
 #
 
 for f in ${CLUSTER_DIR}/cluster-api-manifests/03_*.yaml; do
-    if ! ${OC} get -f $f > /dev/null 2>&1 ; then
-        ${OC} create -f $f
+    if ! ${KUBECTL} get -f $f > /dev/null 2>&1 ; then
+        ${KUBECTL} create -f $f
     fi
 done
 
 for node in {master-0,master-1,master-2}; do
-    while [ "$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-${node} -o json | jq -r '.spec.instanceID')" == 'null' ]; do
-        echo "Waiting for ${node} node to be provisioned"
-        sleep 5
-    done
-done
-
-for node in {master-0,master-1,master-2}; do
-    while [ "$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-${node} -o json | jq -r '.status.instanceState')" != 'running' ]; do
-        echo "Waiting for ${node} node to be running"
-        sleep 5
-    done
-done
-
-master_0_id=$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-master-0 -o json | jq -r '.spec.instanceID')
-master_1_id=$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-master-1 -o json | jq -r '.spec.instanceID')
-master_2_id=$(${OC} get awsmachine --namespace openshift-cluster-api-guests ${infra_id}-master-2 -o json | jq -r '.spec.instanceID')
-
-for id in {"${master_0_id}","${master_1_id}","${master_2_id}"}; do
-    int_api_target_health=$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${api_target_arn} --targets "Id=${id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State')
-    if [ "${int_api_target_health}" == "unused" ] ; then
-        echo "Registering node ${id} to internal load balancer (API)"
-        ${AWS} elbv2 register-targets --region ${region} --target-group-arn ${api_target_arn} --targets "Id=${id}"
-    fi
-
-    int_mcs_target_health=$(${AWS} elbv2 describe-target-health --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${id}" | jq -r '.TargetHealthDescriptions[0].TargetHealth.State')
-    if [ "${int_mcs_target_health}" == "unused" ] ; then
-        echo "Registering node ${id} to internal load balancer (MCS)"
-        ${AWS} elbv2 register-targets --region ${region} --target-group-arn ${mcs_target_arn} --targets "Id=${id}"
-    fi
+    wait_for_machine ${infra_id}-${node} || exit 1
 done
 
 #
@@ -459,7 +424,7 @@ done
 #
 
 start_bootrap=$(date +%s)
-while ! KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get configmap -n kube-system bootstrap -o json 2>&1 > /dev/null; do
+while ! KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get configmap -n kube-system bootstrap -o json > /dev/null 2>&1; do
     now_ts=$(date +%s)
     if [ $((${now_ts} - ${start_bootrap})) -gt 1800 ] ; then
         echo "Bootstrap failed to complete after 30 minutes"
@@ -469,9 +434,8 @@ while ! KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get configmap -n kube-sy
     echo "Waiting for bootstrap configmap"
     sleep 30
 done
-    
-    
-while [ $(KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get configmap -n kube-system bootstrap -o json | jq -r '.data["status"]') != "complete" ]; do
+
+while [ "$(KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get configmap -n kube-system bootstrap -o json | jq -r '.data["status"]')" != "complete" ]; do
     now_ts=$(date +%s)
     if [ $((${now_ts} - ${start_bootrap})) -gt 1800 ] ; then
         echo "Bootstrap failed to complete after 30 minutes"
@@ -491,19 +455,16 @@ done
 #
 
 bootstrap_machine="${CLUSTER_DIR}/cluster-api-manifests/02_bootstrap-machine.yaml"
-if ${OC} get -f ${bootstrap_machine} > /dev/null 2>&1 ; then
-    ${OC} delete -f ${bootstrap_machine}
+if ${KUBECTL} get -f ${bootstrap_machine} > /dev/null 2>&1 ; then
+    ${KUBECTL} delete -f ${bootstrap_machine}
 fi
 
-while [ ${OC} get -f ${bootstrap_machine} > /dev/null 2>&1 ]; do
+while ${KUBECTL} get -f ${bootstrap_machine} > /dev/null 2>&1; do
     echo "Waiting for bootstrap machine to be deleted"
     sleep 5
 done
 
-if ${AWS} ec2 describe-security-groups --region ${region} --filter Name="group-name",Values="${infra_id}-ocp-bootstrap" 2>&1 > /dev/null ; then
-    echo "Deleting security group ${infra_id}-ocp-bootstrap"
-    ${AWS} ec2 delete-security-group --region ${region} --group-id ${bootstrap_sg_id}
-fi
+# The AWS version deleted the bootstrap security group here. CAPHCI has no security groups.
 
 #
 # END: Destroy bootstrap node

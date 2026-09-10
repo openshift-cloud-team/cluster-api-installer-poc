@@ -1,0 +1,40 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AzureStackHCICluster
+metadata:
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+  name: ${INFRA_ID}
+  namespace: capi-guests
+spec:
+  resourceGroup: ${RESOURCE_GROUP}
+  location: ${LOCATION}
+  version: "${KUBERNETES_VERSION}"
+  networkSpec:
+    vnet:
+      name: ${VNET_NAME}
+      group: ${VNET_RESOURCE_GROUP}
+  # The API VIP is served in-cluster by the keepalived/haproxy static pods that the
+  # machine-config-operator deploys on the baremetal platform. We supply the endpoint here and
+  # CAPHCI leaves it alone.
+  controlPlaneEndpoint:
+    host: ${API_VIP}
+    port: 6443
+  #
+  # azureStackHCILoadBalancer is deliberately omitted.
+  #
+  # When it is nil, AzureStackHCIClusterReconciler.reconcileAzureStackHCILoadBalancer() logs
+  # "Skipping load balancer reconciliation" and returns ready. The controlPlaneEndpoint overwrite
+  # lives inside that same function, so the value above survives.
+  #
+  # Enabling it would not help us even if we wanted an external LB:
+  #   * it creates exactly one TCP LoadBalancingRule, so there is no way to serve 6443, 22623 and
+  #     the ingress ports from one AzureStackHCILoadBalancer;
+  #   * Reconcile() short-circuits with "no update supported for now" once created;
+  #   * it requires a pre-existing MOC vippool that the API cannot create; and
+  #   * its replica VMs are booted with an empty bootstrapdata, so they need a self-configuring
+  #     haproxy appliance gallery image, which does not exist for RHCOS.
+  #
+  #azureStackHCILoadBalancer:
+  #  vmSize: ${CONTROL_PLANE_VM_SIZE}
+  #  sshPublicKey: ${SSH_PUBLIC_KEY_B64}
+  #  replicas: 1

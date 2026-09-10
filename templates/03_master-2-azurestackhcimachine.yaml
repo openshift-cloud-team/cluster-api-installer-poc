@@ -1,0 +1,28 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AzureStackHCIMachine
+metadata:
+  name: ${INFRA_ID}-master-2
+  namespace: capi-guests
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+    cluster.x-k8s.io/control-plane: ""
+spec:
+  vmSize: ${CONTROL_PLANE_VM_SIZE}
+  location: ${LOCATION}
+  # Must be base64 encoded; the reconciler base64-decodes this field and fails if it cannot.
+  sshPublicKey: ${SSH_PUBLIC_KEY_B64}
+  storageContainer: ${STORAGE_CONTAINER}
+  allocatePublicIP: false
+  image:
+    # All three masters share one image: master.ign is identical across them. Nothing here
+    # distinguishes master-2 from its peers, so its address and hostname must come from DHCP.
+    name: ${MASTER_IMAGE_NAME}
+    osType: Linux
+  osDisk:
+    # Only osType is honoured. generateStorageProfile() derives the OS disk URI from the VM name
+    # and never reads name, source or diskSizeGB, but the CRD requires all four to be present.
+    name: ${INFRA_ID}-master-2-osdisk
+    source: ""
+    osType: Linux
+    diskSizeGB: 120
+  # availabilityZone omitted deliberately: see 02_bootstrap-azurestackhcimachine.yaml.

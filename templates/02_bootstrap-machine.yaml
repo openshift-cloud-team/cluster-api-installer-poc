@@ -1,16 +1,26 @@
-apiVersion: cluster.x-k8s.io/v1beta1
+apiVersion: cluster.x-k8s.io/${CAPI_CORE_VERSION}
 kind: Machine
 metadata:
   name: ${INFRA_ID}-bootstrap
-  namespace: openshift-cluster-api-guests
+  namespace: capi-guests
   labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+    # MachineScope.Role() derives the machine role from this label via
+    # util.IsControlPlaneMachine(). Without it the AzureStackHCIMachine controller cannot pick a
+    # subnet name and refuses to create the virtual machine.
     cluster.x-k8s.io/control-plane: ""
 spec:
+  clusterName: ${INFRA_ID}
   bootstrap:
+    # CAPI requires bootstrap data to exist before an infrastructure machine is provisioned, and
+    # MachineScope.GetBootstrapData() errors if the secret or its "value" key is missing. Nothing
+    # consumes the contents: the ignition config is baked into the gallery image instead, so the
+    # secret holds a placeholder. See docs/azurestackhci-port-plan.md.
     dataSecretName: ${INFRA_ID}-bootstrap-user-data
-  clusterName: ${INFRA_ID} 
+  # ContractVersionedObjectReference in v1beta2: apiGroup, not apiVersion, and no namespace. The
+  # version comes from the contract label on the AzureStackHCIMachine CRD. See
+  # 01_capi-cluster.yaml.
   infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
-    kind: AWSMachine
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: AzureStackHCIMachine
     name: ${INFRA_ID}-bootstrap
-  failureDomain: ${REGION}a

@@ -1,16 +1,18 @@
-apiVersion: cluster.x-k8s.io/v1beta1
+apiVersion: cluster.x-k8s.io/${CAPI_CORE_VERSION}
 kind: Machine
 metadata:
   name: ${INFRA_ID}-master-1
-  namespace: openshift-cluster-api-guests
+  namespace: capi-guests
   labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
     cluster.x-k8s.io/control-plane: ""
 spec:
+  clusterName: ${INFRA_ID}
   bootstrap:
+    # Placeholder only. master.ign is baked into the gallery image; see 02_bootstrap-machine.yaml.
     dataSecretName: ${INFRA_ID}-master-user-data
-  clusterName: ${INFRA_ID} 
+  # ContractVersionedObjectReference in v1beta2; see 01_capi-cluster.yaml.
   infrastructureRef:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha4
-    kind: AWSMachine
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: AzureStackHCIMachine
     name: ${INFRA_ID}-master-1
-  failureDomain: ${REGION}b
