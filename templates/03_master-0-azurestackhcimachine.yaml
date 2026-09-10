@@ -21,6 +21,9 @@ spec:
   osDisk:
     # Only osType is honoured. generateStorageProfile() derives the OS disk URI from the VM name
     # and never reads name, source or diskSizeGB, but the CRD requires all four to be present.
+    #
+    # The real root disk size is set when the image is built -- IMAGE_DISK_SIZE_GB in
+    # lib/build-image.sh. Changing diskSizeGB here has no effect whatsoever.
     name: ${INFRA_ID}-master-0-osdisk
     source: ""
     osType: Linux

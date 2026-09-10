@@ -1,0 +1,47 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AzureStackHCIMachineTemplate
+metadata:
+  name: ${INFRA_ID}-worker
+  namespace: capi-guests
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+spec:
+  template:
+    spec:
+      vmSize: ${WORKER_VM_SIZE}
+      location: ${LOCATION}
+      # Must be base64 encoded: the reconciler runs base64.StdEncoding.DecodeString() over this
+      # field and fails the machine if it does not decode.
+      sshPublicKey: ${SSH_PUBLIC_KEY_B64}
+      storageContainer: ${STORAGE_CONTAINER}
+      allocatePublicIP: false
+      image:
+        # Per-cluster gallery image with worker.ign already written to /boot/ignition/config.ign.
+        #
+        # Unlike the bootstrap and master images this one is genuinely long-lived. worker.ign is a
+        # pointer config -- verified against openshift-install 5.0.0, it is
+        #     {"ignition":{"config":{"merge":[{"source":"https://<apiVIP>:22623/config/worker"}]},
+        #      "security":{"tls":{"certificateAuthorities":[...]}}}}
+        # so it carries only the cluster root CA and fetches the real config from the machine
+        # config server at boot. It has no 24-hour bootstrap certificate in it, and it does not go
+        # stale the way the bootstrap and master images do.
+        #
+        # Note the merge source is the API VIP, not an api-int DNS name, so scaling workers does
+        # not depend on DNS resolving inside the guest cluster.
+        name: ${WORKER_IMAGE_NAME}
+        osType: Linux
+      osDisk:
+        # Only osType is honoured. generateStorageProfile() derives the OS disk URI from the VM
+        # name and never reads name, source or diskSizeGB, but the CRD requires all four.
+        #
+        # This name is shared by every Machine stamped from this template, which is fine only
+        # because the field is inert. Do not start relying on it.
+        #
+        # The real root disk size is set when the image is built -- IMAGE_DISK_SIZE_GB in
+        # lib/build-image.sh. Changing diskSizeGB here has no effect whatsoever.
+        name: ${INFRA_ID}-worker-osdisk
+        source: ""
+        osType: Linux
+        diskSizeGB: 120
+      # availabilityZone is deliberately omitted; see 02_bootstrap-azurestackhcimachine.yaml for
+      # the nil-dereference this avoids.

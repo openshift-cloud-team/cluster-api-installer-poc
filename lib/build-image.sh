@@ -134,6 +134,19 @@ fetch_metal_artifact() {
     echo "${cached}"
 }
 
+# Size of the VHDX we hand to MOC, in GiB.
+#
+# This is load bearing, and the reason it lives here rather than on the machine templates: CAPHCI
+# ignores osDisk.diskSizeGB. Nothing in cloud/ or controllers/ reads the field, and
+# reconcileDisk() names the disk with GenerateOSDiskName(vmScope.Name()) over a commented-out
+# `//disk.Name`. The VM's root disk is therefore exactly as big as the image we upload, and the
+# RHCOS metal artifact is around 16 GiB -- far too small for a control plane node once etcd and
+# the release payload images land on it.
+#
+# So the size has to be baked into the image. The VHDX is dynamic, so the empty tail costs nothing
+# on disk or on upload, and RHCOS grows the root partition to fill the disk on first boot.
+IMAGE_DISK_SIZE_GB=${IMAGE_DISK_SIZE_GB:-120}
+
 # build_image <work-dir> <base-image> <ignition-file> <output-vhdx> [karg ...]
 #
 # Writes the ignition config into a copy of the base metal image and converts the result to VHDX.
@@ -179,8 +192,18 @@ build_image() {
         "${karg_args[@]}" \
         "/work/$(basename "${raw}")" || return 1
 
-    echo "Converting $(basename "${raw}") to VHDX"
-    ${QEMU_IMG} convert -f raw -O vhdx -o subformat=dynamic "${raw}" "${output}.partial" || return 1
+    # Create the target at the size we want first, then convert into it with -n ("skip the
+    # creation of the target volume"). qemu-img convert on its own sizes the output to the input,
+    # which would leave us with a ~16 GiB root disk -- see IMAGE_DISK_SIZE_GB above.
+    #
+    # UNTESTED: this two-step form has not been run end to end, only the single-step convert has.
+    # If -n rejects the vhdx target, the equivalent is a plain convert followed by
+    #     ${QEMU_IMG} resize "${output}" ${IMAGE_DISK_SIZE_GB}G
+    echo "Converting $(basename "${raw}") to a ${IMAGE_DISK_SIZE_GB}GiB VHDX"
+    rm -f "${output}.partial"
+    ${QEMU_IMG} create -f vhdx -o subformat=dynamic "${output}.partial" \
+        "${IMAGE_DISK_SIZE_GB}G" || return 1
+    ${QEMU_IMG} convert -f raw -O vhdx -n "${raw}" "${output}.partial" || return 1
     mv "${output}.partial" "${output}"
     rm -f "${raw}"
 }

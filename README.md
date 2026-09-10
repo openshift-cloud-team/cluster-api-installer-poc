@@ -305,6 +305,70 @@ Override binary locations with `OC`, `KUBECTL`, `OPENSHIFT_INSTALL`, `MOCCTL`, `
 The script is written to be re-entrant: re-running it after a failure skips work that is already
 done, including the image build and upload.
 
+## Adding worker nodes
+
+`create-cluster.sh` finishes by applying a `MachineDeployment` named `<infra-id>-worker`, by
+default at zero replicas. It is the only way to get workers: MachineAPI is disabled, so the guest
+cluster has no `MachineSet` of its own.
+
+**Read this before scaling it up. Worker *nodes* work; worker *Machines* do not.**
+
+The VMs boot, Ignition runs from the baked-in `worker.ign`, the kubelet fetches its real config
+from the machine config server on the API VIP, and once you approve its CSRs the node goes `Ready`
+and schedules pods. That whole path is sound, and the worker image — unlike the bootstrap and
+master images — does not expire, because `worker.ign` is a pointer config carrying the cluster root
+CA rather than a 24-hour bootstrap certificate.
+
+What does not work is CAPI knowing about them. There is no Azure Local cloud controller manager,
+so nothing sets `Node.spec.providerID`, and that is the only thing CAPI matches a Machine to a Node
+on. `status.nodeRef` stays nil, the Machines never leave `Provisioned`, and deleting one skips
+drain. `link-nodes.sh` sets the providerID by hand.
+
+Scale up **one replica at a time**. That is not caution for its own sake: CAPHCI publishes neither
+the VM's IP nor its MAC, so there is no attribute shared between a Machine and a Node to match on,
+and `link-nodes.sh` will only act when exactly one of each is unmatched.
+
+```
+kubectl scale machinedeployment <infra-id>-worker -n capi-guests --replicas=1
+
+# Two CSRs per node -- the serving cert only appears once the client cert is approved, so expect
+# to run this twice. machine-approver will not do it for you: with MachineAPI disabled it has no
+# Machine object in the guest cluster to correlate against.
+KUBECONFIG=<cluster-dir>/auth/kubeconfig oc get csr -o name \
+  | xargs KUBECONFIG=<cluster-dir>/auth/kubeconfig oc adm certificate approve
+
+./link-nodes.sh <cluster-dir>
+```
+
+## Pivoting the cluster to manage itself
+
+Once every Machine has a nodeRef, the CAPI objects can be moved out of the kind cluster and into
+the guest cluster, so it manages its own workers:
+
+```
+./pivot-cluster.sh <cluster-dir>
+```
+
+`link-nodes.sh` is a **prerequisite, not a convenience**. `clusterctl move` runs
+`checkProvisioningCompleted()` over the whole namespace and aborts if any single Machine lacks a
+nodeRef — which, before `link-nodes.sh`, is all of them, the three masters included.
+
+`pivot-cluster.sh` checks that and four other preconditions before touching anything. Two are easy
+to get wrong:
+
+* CAPHCI must be installed in the guest cluster with `clusterctl init`, **not** `kubectl apply`.
+  `clusterctl move` finds what to move by listing CRDs labelled `clusterctl.cluster.x-k8s.io`, and
+  only clusterctl applies that label.
+* `default/caphlogintoken` must be copied across. CAPHCI has no identity CRD — that one Secret is
+  the whole authentication story, and it sits outside the cluster's object graph so the move does
+  not carry it. `AZURESTACKHCI_CLOUDAGENT_FQDN` needs setting on the controller Deployment there
+  too, and the guest cluster's pods have to be able to reach the cloudagent.
+
+**A pivoted cluster cannot destroy itself.** Deleting the `Cluster` is what removes the VMs, and
+after the pivot the controllers doing the deleting are running on those VMs. Move the objects back
+to a management cluster first; `destroy-cluster.sh` refuses to run otherwise and prints the
+command.
+
 ## Destroying the guest cluster
 
 ```
@@ -336,10 +400,15 @@ The full list, with source citations, is in
   gated on that capability alone, so it is deployed. With `provisioningNetwork: Disabled` it should
   have nothing to reconcile, but nobody tests this pairing. `oc get clusteroperator baremetal` is
   the thing to watch on the first install.
-* **No guest-cluster node lifecycle.** MachineAPI is off and there is no Azure Local CCM or CSI
-  driver. Workers are static, CSRs are approved by hand, there are no dynamic PVs and no
-  `Service type=LoadBalancer`. The worker image is built and uploaded but nothing in the PoC
-  consumes it — scaling means writing more `03_`-style manifests by hand.
+* **Worker Machines never reach `Running`.** The nodes work; the Machine objects do not. With no
+  CCM nothing sets `Node.spec.providerID`, which is the only thing CAPI matches on, so `nodeRef`
+  stays nil, `availableReplicas` sits at 0, deletion skips drain, and `clusterctl move` refuses to
+  start. `link-nodes.sh` works around it one node at a time. See
+  [Adding worker nodes](#adding-worker-nodes).
+* **`vmState: Succeeded` means "MOC has a VM record", not "the VM booted."** `SDKToVM()`
+  hard-codes the state, with a comment saying so. Distrust it first when an install stalls.
+* **No dynamic PVs, no `Service type=LoadBalancer`, no autoscaling.** These need a CSI driver and
+  a CCM, and neither exists for Azure Local.
 * **No static IPs, no security groups, no object storage, no DNS integration.** Four CAPA
   capabilities with no CAPHCI analogue.
 * **CAPHCI's load balancer is unusable for OpenShift** and is deliberately skipped. It creates one

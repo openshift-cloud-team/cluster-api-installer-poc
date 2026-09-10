@@ -9,7 +9,7 @@ spec:
   # In v1beta2 this is a ContractVersionedObjectReference, not an ObjectReference: apiGroup rather
   # than apiVersion, and no namespace field at all. The version is resolved from the
   # cluster.x-k8s.io/v1beta2 contract label on the referenced CRD, which CAPHCI's kustomization
-  # applies -- so the CRDs must be installed with 'make deploy', not by applying
+  # applies -- so the provider must be installed via clusterctl (see the README), not by applying
   # config/crd/bases/*.yaml directly.
   infrastructureRef:
     apiGroup: infrastructure.cluster.x-k8s.io

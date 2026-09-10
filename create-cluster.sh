@@ -66,13 +66,21 @@ preflight_error() {
 }
 
 for var in RESOURCE_GROUP LOCATION VNET_NAME VNET_RESOURCE_GROUP STORAGE_CONTAINER \
-           SSH_PUBLIC_KEY_B64 CONTROL_PLANE_VM_SIZE BOOTSTRAP_VM_SIZE API_VIP \
-           KUBERNETES_VERSION CAPI_CORE_VERSION; do
+           SSH_PUBLIC_KEY_B64 CONTROL_PLANE_VM_SIZE BOOTSTRAP_VM_SIZE WORKER_VM_SIZE \
+           WORKER_REPLICAS API_VIP KUBERNETES_VERSION CAPI_CORE_VERSION; do
     if [ -z "${!var}" ]; then
         preflight_error "${var} is not set in ${CLUSTER_DIR}/azurelocal.env" \
                         "See ${SCRIPT_ROOT}/azurelocal.env.example"
     fi
 done
+
+# WORKER_REPLICAS is substituted straight into MachineDeployment.spec.replicas, which is an
+# integer. Anything non-numeric produces a manifest that fails to parse several minutes later,
+# after the images have already been built and uploaded.
+if ! [[ "${WORKER_REPLICAS}" =~ ^[0-9]+$ ]]; then
+    preflight_error "WORKER_REPLICAS must be a non-negative integer, got '${WORKER_REPLICAS}'" \
+                    "Leave it at 0 for the install and scale up afterwards"
+fi
 
 # base64.StdEncoding.DecodeString() is applied to sshPublicKey by the reconciler.
 if [ -n "${SSH_PUBLIC_KEY_B64}" ] && ! echo "${SSH_PUBLIC_KEY_B64}" | base64 -d > /dev/null 2>&1; then
@@ -293,6 +301,7 @@ substitutions='${INFRA_ID} ${LOCATION} ${RESOURCE_GROUP} ${VNET_NAME} ${VNET_RES
 substitutions+=' ${SSH_PUBLIC_KEY_B64} ${STORAGE_CONTAINER} ${CONTROL_PLANE_VM_SIZE}'
 substitutions+=' ${BOOTSTRAP_VM_SIZE} ${API_VIP} ${KUBERNETES_VERSION} ${CAPI_CORE_VERSION}'
 substitutions+=' ${BOOTSTRAP_IMAGE_NAME} ${MASTER_IMAGE_NAME} ${WORKER_IMAGE_NAME}'
+substitutions+=' ${WORKER_VM_SIZE} ${WORKER_REPLICAS}'
 
 for f in ${SCRIPT_ROOT}/templates/*.yaml; do
     INFRA_ID=${infra_id} \
@@ -310,6 +319,8 @@ for f in ${SCRIPT_ROOT}/templates/*.yaml; do
     BOOTSTRAP_IMAGE_NAME=${bootstrap_image_name} \
     MASTER_IMAGE_NAME=${master_image_name} \
     WORKER_IMAGE_NAME=${worker_image_name} \
+    WORKER_VM_SIZE=${WORKER_VM_SIZE} \
+    WORKER_REPLICAS=${WORKER_REPLICAS} \
     envsubst "${substitutions}" < $f > ${CLUSTER_DIR}/cluster-api-manifests/$(basename $f)
 done
 
@@ -477,4 +488,45 @@ done
 # END: Destroy bootstrap node
 #
 
+#
+# BEGIN: Create worker MachineDeployment
+#
+# Applied last, and by default with replicas: 0. A worker cannot join before the masters are
+# serving the machine config server on the API VIP, and the AWS version had no equivalent step at
+# all -- there, workers came from Machine API MachineSets that the installer generated. Here
+# MachineAPI is disabled, so this MachineDeployment is the only thing that can create workers.
+#
+# Read docs/azurestackhci-port-plan.md "Phase 2: workers and pivot" before scaling this up. In
+# short: the VMs boot and the nodes join after their CSRs are approved by hand, but the Machines
+# never reach Running, because nothing sets Node.spec.providerID. link-nodes.sh closes that gap
+# one node at a time.
+
+for f in ${CLUSTER_DIR}/cluster-api-manifests/04_*.yaml; do
+    if ! ${KUBECTL} get -f $f > /dev/null 2>&1 ; then
+        ${KUBECTL} create -f $f
+    fi
+done
+
+#
+# END: Create worker MachineDeployment
+#
+
 echo "Cluster installation complete"
+
+if [ "${WORKER_REPLICAS}" == "0" ]; then
+    cat <<EOF
+
+The cluster has no workers. The MachineDeployment ${infra_id}-worker exists at 0 replicas; scale it
+up one replica at a time:
+
+  ${KUBECTL} scale machinedeployment ${infra_id}-worker -n ${NAMESPACE} --replicas=1
+
+Then, for each worker, approve its two CSRs and link the Node to its Machine:
+
+  KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} get csr -o name | xargs \\
+    KUBECONFIG=${CLUSTER_DIR}/auth/kubeconfig ${OC} adm certificate approve
+  ./link-nodes.sh ${CLUSTER_DIR}
+
+The second CSR only appears once the first is approved, so expect to run the approve twice.
+EOF
+fi

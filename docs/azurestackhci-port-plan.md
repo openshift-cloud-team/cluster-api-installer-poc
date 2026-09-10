@@ -381,6 +381,163 @@ TechPreviewNoUpgrade / install an OpenShift management cluster" section with:
 - Rewrite the FAQ: the "why not `openshift-install` to destroy" answer is now about CAPHCI owning
   the VMs rather than AWS tag semantics, and the multi-cloud answer changes completely.
 
+## Phase 2: workers and pivot
+
+Gap 10 originally said the worker image was built and uploaded but nothing consumed it. This
+section is what consumes it. The question it answers is a narrow one, and it is worth stating the
+answer before the detail:
+
+> **Would this get us to working worker machines after manual CSR approval?**
+>
+> Working worker **nodes**, yes. Working worker **Machines**, no.
+
+Those are two different objects and only one of them works, so they are treated separately below.
+
+### What works: the node
+
+Nothing on the path from "MachineDeployment scaled up" to "node running pods" depends on anything
+CAPHCI does badly.
+
+1. The MachineSet controller clones `AzureStackHCIMachineTemplate/${INFRA_ID}-worker` into an
+   `AzureStackHCIMachine`, and CAPHCI creates the MOC VM from `${WORKER_IMAGE_NAME}`.
+2. The VM boots the worker gallery image. `worker.ign` is already at `/boot/ignition/config.ign`,
+   so Ignition consumes it on the `metal` platform path, exactly as on the masters.
+3. `worker.ign` is a **pointer config** — verified against `openshift-install` 5.0.0 it is nothing
+   but a merge source and a CA bundle:
+
+   ```json
+   {"ignition":{"config":{"merge":[{"source":"https://<apiVIP>:22623/config/worker"}]},
+    "security":{"tls":{"certificateAuthorities":[...]}}}}
+   ```
+
+   The node fetches its real MachineConfig from the machine config server. Two things follow.
+   First, **the worker image does not go stale** the way the bootstrap and master images do: it
+   holds the cluster root CA, not a 24-hour bootstrap certificate, so it stays valid for the life
+   of the cluster and workers can be added months later. Second, the merge source is the API VIP,
+   not `api-int.<domain>`, so scaling workers does not depend on DNS resolving from inside the
+   guest cluster — keepalived is already answering on that address.
+
+4. The kubelet starts and files a CSR. `machine-approver` will not approve it: with MachineAPI
+   disabled there is no Machine object *in the guest cluster* for it to correlate against, which
+   is precisely the check it performs. So two CSRs per node are approved by hand — the client
+   cert, then the serving cert, and the second only appears once the first is approved.
+5. The node goes `Ready` and schedules pods.
+
+Steps 1–5 never touch the part of CAPI that is broken here. Role makes no difference to the VM
+either: the `Node`/`ControlPlane` switch in `azurestackhcimachine_controller.go:311` only picks a
+subnet name, and `networkinterfaces.Reconcile()` never reads `SubnetName` — it sets the NIC's
+subnet ID to the *vnet* name. Workers land on the same flat L2 as everything else.
+
+### What does not work: the Machine
+
+`Machine.status.nodeRef` stays nil forever, on workers and masters alike.
+
+CAPI resolves Machine → Node **only** by provider ID. `getNode()` in
+`internal/controllers/machine/machine_controller_noderef.go` matches `Node.spec.providerID`
+against `Machine.spec.providerID` and has no hostname fallback. CAPHCI does set
+`Machine.spec.providerID`, to `moc://<machine-name>`
+(`azurestackhcimachine_controller.go:239`). Nothing sets the other half:
+
+- there is no Azure Local cloud controller manager to do node initialisation;
+- MachineAPI is disabled, so nothing writes it from that side;
+- the kubelet's `--provider-id` cannot come from a shared MachineConfig, because the value is
+  per-node while the config is shared, and the DHCP-supplied hostname has no relationship to the
+  CAPI-generated machine name.
+
+Consequences, in increasing order of severity:
+
+- `MachineDeployment.status.availableReplicas` sits at 0 and the Machines stay in `Provisioned`,
+  never reaching `Running`. Cosmetic, but it means `kubectl get machines` tells you nothing useful
+  about the cluster.
+- Deleting a Machine skips drain. CAPI hits `errNilNodeRef` and goes straight to deleting the VM,
+  so workloads are killed abruptly and the Node object is orphaned in the guest cluster.
+- **`clusterctl move` refuses to run at all.** This is the one that turns a cosmetic problem into
+  a blocker.
+
+### Why pivot is blocked, not merely degraded
+
+`checkProvisioningCompleted()` (`cmd/clusterctl/client/cluster/mover.go:227-281`) is a hard
+precondition on the whole move, and it requires three things:
+
+| Precondition | State here |
+|---|---|
+| `Cluster.status.initialization.infrastructureProvisioned` | True — CAPHCI sets it |
+| `Cluster` condition `ControlPlaneInitialized` | **False** |
+| **Every** `Machine` has `status.nodeRef` set | **False** |
+
+The third fails for every Machine in the namespace, including the three masters that have been
+running since the install. And the second is not an independent problem: with no `controlPlaneRef`
+on the Cluster, `setControlPlaneInitializedCondition()` falls through to *"this cluster control
+plane is composed by stand-alone machines, and initialized is assumed true when at least one of
+those machines has a node"* — `controlPlaneMachines.Filter(collections.HasNode())`. It is the same
+missing nodeRef, counted twice.
+
+So `link-nodes.sh` is a **prerequisite for the pivot, not a convenience**. Until it has been run
+against every Machine, `clusterctl move` will not start.
+
+### `link-nodes.sh`
+
+It patches `Node.spec.providerID` to the matching Machine's value, which is all CAPI needs.
+
+The hard part is knowing which Node goes with which Machine, and the honest answer is that
+**CAPHCI publishes nothing to join on**:
+
+- `status.addresses` is declared on both `AzureStackHCIMachine` and
+  `AzureStackHCIVirtualMachine` and never written;
+- `networkinterfaces.Spec.MacAddress` exists and is applied to the NIC, but the reconciler that
+  builds the spec never populates it;
+- `converters.SDKToVM()` throws away everything MOC returns except ID and Name.
+
+There is no IP, no MAC, and the VM name is CAPI-generated while the hostname comes from DHCP. So
+the script does not guess. It acts only when there is exactly one unmatched Machine and exactly
+one unmatched Node, and refuses otherwise with the two manual resolutions spelled out. **Scale
+workers up one replica at a time** and that condition always holds — hence `WORKER_REPLICAS`
+defaulting to 0 and `create-cluster.sh` printing the one-at-a-time instructions at the end.
+
+The real fix is roughly forty lines in CAPHCI: the NIC `Get()` already returns the full
+`network.Interface`, so read `IPConfigurations[0].PrivateIPAddress` and write it to
+`status.addresses`. CAPI's `machine_controller_phases.go` already copies infra `status.addresses`
+onto the Machine, and matching by IP would then be exact and automatic. Worth proposing upstream.
+
+### `pivot-cluster.sh`
+
+Runs the five preconditions as an explicit preflight — `clusterctl move` reports most of them
+poorly — then `--dry-run`, then an interactive confirmation, then the move. The two preconditions
+beyond `checkProvisioningCompleted()`:
+
+- **CAPHCI must be installed in the guest cluster via `clusterctl init`, not `kubectl apply`.**
+  `clusterctl move` discovers what to move by listing CRDs labelled
+  `clusterctl.cluster.x-k8s.io`, and only clusterctl applies that label. This is the same reason
+  the README installs the provider that way on the management cluster.
+- **`default/caphlogintoken` must be copied across.** CAPHCI has no identity CRD; authentication
+  is that one global Secret, and it lives outside the cluster's object graph so the move does not
+  carry it. `AZURESTACKHCI_CLOUDAGENT_FQDN` must also be set on the controller Deployment there,
+  and the guest cluster's pods must actually be able to reach the cloudagent — the kind cluster's
+  network path to it says nothing about the guest cluster's.
+
+### After the pivot: the cluster cannot destroy itself
+
+Deleting the `Cluster` object is what removes the VMs, and after a pivot the controllers doing the
+deleting are running on those VMs. The control plane disappears mid-reconcile and the remaining
+VMs, NICs and disks leak.
+
+`destroy-cluster.sh` therefore refuses to run when the `Cluster` is absent from the current
+context but present in the guest cluster, and prints the `clusterctl move` command to bring the
+objects back first. Without that guard it would carry on and delete the gallery images, leaving
+VMs running that could no longer be rebuilt.
+
+### What Phase 2 does not fix
+
+- Machines still report `vmState: Succeeded` and `ready: true` the moment MOC has a VM record.
+  `SDKToVM()` **hard-codes** `State: infrav1.VMStateSucceeded` with the comment *"Hard-coded for
+  now until we expose provisioning state"*, so this says nothing about whether the VM booted. See
+  gap 14.
+- No `MachineHealthCheck`. An MHC keys off `nodeRef` and the Node conditions behind it; before
+  `link-nodes.sh` runs it would either no-op or, if it treated "no node" as unhealthy, delete and
+  recreate every worker in a loop.
+- No autoscaling, no `Service type=LoadBalancer`, no dynamic PVs. Those need a CCM and a CSI
+  driver, and neither exists for Azure Local.
+
 ## Known gaps to document
 
 1. **The images are cluster-specific and single-use, and iteration is slow.** Every ignition
@@ -486,11 +643,16 @@ TechPreviewNoUpgrade / install an OpenShift management cluster" section with:
    CAPH-created vnet is never cleaned up, while a pre-existing vnet tagged with some *other*
    owner is deleted. Untagged pre-existing vnets are safe. Worth reporting upstream; until then,
    point `${VNET_NAME}` at a dedicated vnet and expect to remove it by hand.
-10. **No guest-cluster node lifecycle.** MachineAPI is off and there is no Azure Local CCM or CSI
-    driver, so workers are static, CSRs are approved by hand, there are no dynamic PVs, and no
-    `Service type=LoadBalancer`. Scaling means adding `03_`-style manifests manually — the worker
-    image exists and is uploaded, but nothing in the PoC consumes it, which is worth stating
-    plainly in the README.
+10. **Partial guest-cluster node lifecycle.** *Revised by Phase 2 above; the original text said
+    workers were static and the worker image unconsumed, and that is no longer true.* Workers now
+    come from a CAPI `MachineDeployment`, and scaling it up does produce working, schedulable
+    nodes — but only after their CSRs are approved by hand, because with MachineAPI disabled
+    `machine-approver` has no Machine object in the guest cluster to correlate against. The
+    Machine objects themselves never reach `Running`: with no CCM nothing sets
+    `Node.spec.providerID`, so `status.nodeRef` stays nil, deletion skips drain, and
+    `clusterctl move` refuses to start. `link-nodes.sh` patches the providerID by hand, one node
+    at a time. Still absent entirely: dynamic PVs and `Service type=LoadBalancer`, which need a
+    CSI driver and a CCM that do not exist for Azure Local.
 11. **API version skew.** CAPHCI master is built against CAPI v1.13.3 and imports core
     `cluster.x-k8s.io/v1beta2`. Infra kinds are pinned to `v1beta2`; the core `Cluster`/`Machine`
     apiVersion is parameterised as `${CAPI_CORE_VERSION}` and must match what the management
@@ -513,6 +675,26 @@ TechPreviewNoUpgrade / install an OpenShift management cluster" section with:
     `oc get clusteroperator baremetal` on the first install; if it never goes Available the install
     will not complete and the fallback is `platform: none`, which costs the on-prem VIP stack and
     therefore requires an external load balancer after all.
+14. **`vmState: Succeeded` and `ready: true` do not mean the VM booted.**
+    `converters.SDKToVM()` returns only the ID and Name from what MOC gives back and then
+    **hard-codes** `State: infrav1.VMStateSucceeded`, with the comment *"Hard-coded for now until
+    we expose provisioning state"*. The status therefore means "MOC has a VM record", nothing
+    more. This directly undermines the bootstrap and master poll loops in `create-cluster.sh`:
+    they will report success and move on while the VM is still coming up, or while it is failing
+    to boot the image at all. The real signals are further downstream — the `kube-system/bootstrap`
+    ConfigMap for the bootstrap node, and a node appearing for the masters — and both loops
+    already wait on those, so the practical damage is a misleading progress message rather than a
+    wrong outcome. It is still the first status field to distrust when debugging a failed install.
+15. **`osDisk.diskSizeGB` is ignored, so the root disk size has to be baked into the image.**
+    Nothing under `cloud/` or `controllers/` reads the field, and `reconcileDisk()` names the disk
+    with `GenerateOSDiskName(vmScope.Name())` over a commented-out `//disk.Name`. Left alone, the
+    root disk would be exactly the size of the RHCOS metal artifact, around 16 GiB — enough to
+    boot and nowhere near enough for a control plane node once etcd and the release payload land
+    on it. `build_image` therefore creates the VHDX at `IMAGE_DISK_SIZE_GB` (120 by default) and
+    converts into it with `qemu-img convert -n`, rather than letting `convert` size the output to
+    the input. The VHDX is dynamic so the empty tail is free, and RHCOS grows the root partition
+    on first boot. The two-step `create` + `convert -n` form has not been run end to end; if `-n`
+    rejects the VHDX target, a plain convert followed by `qemu-img resize` is equivalent.
 
 ## Verification
 
@@ -577,3 +759,18 @@ No test suite exists and none is proposed — this is a shell-and-YAML PoC. Veri
    the delivery mechanism, which is the crux of the whole design.
 7. End-to-end provisioning needs real Azure Local + MOC access and is out of scope for the branch;
    the README should say so plainly.
+8. Check the Phase 2 manifests and preconditions against source. **Done**, no cluster needed.
+   `AzureStackHCIMachineTemplateSpec.Template` is an `AzureStackHCIMachineTemplateResource` whose
+   `Spec` is a plain `AzureStackHCIMachineSpec`, so the worker template is field-for-field the same
+   as the master machines; every required `OSDisk` field is present. The MachineDeployment webhook
+   (`internal/webhooks/machinedeployment.go:191`) accepts `bootstrap.dataSecretName` on its own
+   with no `configRef`, which is what makes running with no bootstrap provider legal. All thirteen
+   templates render with no unsubstituted variables. `checkProvisioningCompleted()` and
+   `setControlPlaneInitializedCondition()` were read directly and confirm the pivot blocker: with
+   no `controlPlaneRef`, `ControlPlaneInitialized` comes from
+   `controlPlaneMachines.Filter(collections.HasNode())`, so it is the same missing nodeRef as the
+   per-Machine check.
+9. Run the shell under the version of bash people will actually use. **Done**, and it caught one:
+   `link-nodes.sh` used `mapfile`, which does not exist in the bash 3.2 that macOS ships, and it
+   is the one script in the repo likely to be run from a laptop rather than the Linux build host.
+   Replaced with a portable read loop, tested under 3.2. `bash -n` passes on all five scripts.

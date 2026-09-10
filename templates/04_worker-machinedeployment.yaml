@@ -1,0 +1,47 @@
+apiVersion: cluster.x-k8s.io/${CAPI_CORE_VERSION}
+kind: MachineDeployment
+metadata:
+  name: ${INFRA_ID}-worker
+  namespace: capi-guests
+  labels:
+    cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+spec:
+  clusterName: ${INFRA_ID}
+  replicas: ${WORKER_REPLICAS}
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+      cluster.x-k8s.io/deployment-name: ${INFRA_ID}-worker
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: ${INFRA_ID}
+        cluster.x-k8s.io/deployment-name: ${INFRA_ID}-worker
+    spec:
+      clusterName: ${INFRA_ID}
+      version: ${KUBERNETES_VERSION}
+      bootstrap:
+        # No bootstrap provider, and deliberately so. In v1beta2 bootstrap.configRef is optional
+        # precisely to "allow users/operators to specify Bootstrap.DataSecretName without the need
+        # of a controller", which is exactly our case: the real ignition is baked into the gallery
+        # image, so there is nothing for a bootstrap provider to generate.
+        #
+        # The Secret still has to exist and still has to have a 'value' key. CAPI will not mark
+        # bootstrap ready without it, and CAPHCI's GetBootstrapData() errors if it is missing --
+        # even though what it reads is a placeholder that MOC receives as CustomData and RHCOS
+        # never looks at.
+        #
+        # Unlike the masters, every Machine in this deployment shares one Secret. That is safe
+        # here only because the contents are inert. If ignition delivery ever moves to CustomData,
+        # this has to become a per-Machine bootstrap provider.
+        dataSecretName: ${INFRA_ID}-worker-user-data
+      # ContractVersionedObjectReference in v1beta2; see 01_capi-cluster.yaml.
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: AzureStackHCIMachineTemplate
+        name: ${INFRA_ID}-worker
+  # No MachineHealthCheck accompanies this, and that is not an oversight. An MHC keys off
+  # Machine.status.nodeRef and the Node conditions behind it. Until Node.spec.providerID is
+  # populated (see link-nodes.sh) nodeRef is nil on every Machine here, so an MHC would either do
+  # nothing or -- worse, if it treated "no node" as unhealthy -- delete and recreate every worker
+  # in a loop.
