@@ -27,35 +27,72 @@ MOCCTL=${MOCCTL:-mocctl}
 #     until oc get baremetalhosts -n openshift-machine-api
 # waiting for a CRD that MachineAPI-disabled clusters never create. That matters beyond being
 # untidy: the step after that wait is the one that shuts down the ironic containers "so that the
-# API VIP can fail over to the control plane". If it never runs, the bootstrap node keeps the API
-# VIP and the install cannot complete.
+# API VIP can fail over to the control plane". master-bmh-update.service is also
+# Before=progress.service, so the whole bootstrap progress reporting stalls behind it.
+#
+# The list below was checked against the real bootstrap.ign from openshift-install
+# 5.0.0-0.nightly-2026-07-28-081944. Note that extract-machine-os.service, which older releases
+# carried, no longer exists.
 IRONIC_UNITS=(
     build-ironic-env.service
     build-metal3-env.service
     master-bmh-update.service
     provisioning-interface.service
-    extract-machine-os.service
+)
+
+# Backing scripts for the units above. Derived by hand rather than from the unit names: the script
+# for provisioning-interface.service is start-provisioning-nic.sh, not provisioning-interface.sh.
+IRONIC_SCRIPTS=(
+    /usr/local/bin/build-ironic-env.sh
+    /usr/local/bin/build-metal3-env.sh
+    /usr/local/bin/master-bmh-update.sh
+    /usr/local/bin/start-provisioning-nic.sh
+)
+
+# Ironic and metal3 also ship as Quadlets rather than as systemd.units entries, so removing the
+# units above does not remove them -- podman-systemd generates ironic.service and friends from
+# these files at boot. They would not actually run (ironic.container has
+# Requires=build-ironic-env.service, which no longer exists, and $IRONIC_IMAGE is only appended to
+# /etc/ironic.env by that unit), but metal3-baremetal-operator.container has Restart=always and
+# would restart-loop for the life of the bootstrap node. Drop them outright.
+IRONIC_QUADLETS=(
+    /etc/containers/systemd/image-customization.container
+    /etc/containers/systemd/ironic-dnsmasq.container
+    /etc/containers/systemd/ironic-httpd.container
+    /etc/containers/systemd/ironic-ramdisk-logs.container
+    /etc/containers/systemd/ironic.container
+    /etc/containers/systemd/ironic.volume
+    /etc/containers/systemd/metal3-baremetal-operator.container
 )
 
 # strip_ironic_units <input.ign> <output.ign>
 #
-# Removes the units above and their backing /usr/local/bin scripts.
+# Removes the units above, their backing scripts and the ironic/metal3 Quadlets.
 strip_ironic_units() {
     local input=$1
     local output=$2
 
-    local units_json scripts_json
+    local units_json files_json
     units_json=$(printf '%s\n' "${IRONIC_UNITS[@]}" | jq -R . | jq -sc .)
-    scripts_json=$(printf '%s\n' "${IRONIC_UNITS[@]}" | sed 's|^|/usr/local/bin/|; s|\.service$|.sh|' | jq -R . | jq -sc .)
+    files_json=$(printf '%s\n' "${IRONIC_SCRIPTS[@]}" "${IRONIC_QUADLETS[@]}" | jq -R . | jq -sc .)
 
-    jq --argjson units "${units_json}" --argjson scripts "${scripts_json}" '
+    jq --argjson units "${units_json}" --argjson files "${files_json}" '
         .systemd.units = ((.systemd.units // []) | map(select(.name as $n | ($units | index($n)) | not)))
-        | .storage.files = ((.storage.files // []) | map(select(.path as $p | ($scripts | index($p)) | not)))
+        | .storage.files = ((.storage.files // []) | map(select(.path as $p | ($files | index($p)) | not)))
     ' "${input}" > "${output}" || return 1
 
-    local removed
-    removed=$(( $(jq '(.systemd.units // []) | length' "${input}") - $(jq '(.systemd.units // []) | length' "${output}") ))
-    echo "Stripped ${removed} ironic/metal3 units from $(basename "${input}")"
+    local removed_units removed_files
+    removed_units=$(( $(jq '(.systemd.units // []) | length' "${input}") - $(jq '(.systemd.units // []) | length' "${output}") ))
+    removed_files=$(( $(jq '(.storage.files // []) | length' "${input}") - $(jq '(.storage.files // []) | length' "${output}") ))
+    echo "Stripped ${removed_units} ironic/metal3 units and ${removed_files} files from $(basename "${input}")"
+
+    # If the release being installed renamed or added units, silence here is the dangerous
+    # outcome: the bootstrap node would deadlock exactly as described above with no warning.
+    if [ "${removed_units}" -ne "${#IRONIC_UNITS[@]}" ]; then
+        echo "WARNING: expected to strip ${#IRONIC_UNITS[@]} units, stripped ${removed_units}." >&2
+        echo "         The ironic unit set has changed in this release. Re-check IRONIC_UNITS" >&2
+        echo "         against 'jq -r .systemd.units[].name bootstrap.ign' before trusting this." >&2
+    fi
 }
 
 # fetch_metal_artifact <cache-dir>

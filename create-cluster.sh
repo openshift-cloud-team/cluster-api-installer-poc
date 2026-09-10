@@ -199,9 +199,16 @@ if [ ! -f "${CLUSTER_DIR}/install-config.yaml" ] && [ -f "${CLUSTER_DIR}/.opensh
     # ControlPlaneMachineSet at all -- pkg/asset/machines/{master,worker}.go break out early on
     # !enabledCaps.Has(ClusterVersionCapabilityMachineAPI) -- so there is nothing to patch.
     #
-    # If those files do appear, the capability was not actually disabled and the rest of this
+    # If those objects do appear, the capability was not actually disabled and the rest of this
     # script is built on a false assumption.
-    if compgen -G "${CLUSTER_DIR}/openshift/99_openshift-cluster-api_*" > /dev/null; then
+    #
+    # Check for the kinds, not for the 99_openshift-cluster-api_* filename glob. Verified against
+    # openshift-install 5.0.0: with MachineAPI disabled the installer still writes
+    # 99_openshift-cluster-api_{master,worker}-user-data-secret.yaml -- they are just the pointer
+    # ignition Secrets in openshift-machine-api, and they are harmless. Globbing on the filename
+    # rejects a correctly configured cluster.
+    if grep -qE '^kind: (Machine|MachineSet|ControlPlaneMachineSet|BareMetalHost)$' \
+            "${CLUSTER_DIR}"/openshift/*.yaml 2>/dev/null; then
         echo "Machine API manifests were generated, which means the MachineAPI capability is enabled."
         echo "Set the following in install-config.yaml and start from a clean directory:"
         echo "  capabilities:"

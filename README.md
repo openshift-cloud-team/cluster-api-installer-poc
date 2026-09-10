@@ -100,28 +100,42 @@ on the management side.
 
 ```
 kind create cluster --name capi-mgmt
-export KUBECONFIG=$(kind get kubeconfig-path --name capi-mgmt)
-
-clusterctl init
 ```
 
-Then install CAPHCI. It is not in the `clusterctl` provider registry, so install it from the
-repository:
+CAPHCI is not in the `clusterctl` provider registry, but it ships everything needed to serve
+itself as one. Build a local provider repository and let `clusterctl` install it:
 
 ```
 git clone https://github.com/microsoft/cluster-api-provider-azurestackhci
 cd cluster-api-provider-azurestackhci
-make deploy
+make release-manifests                  # kustomize build config/default > out/infrastructure-components.yaml
+make create-local-provider-repository   # populates ~/local-repository and writes ~/.cluster-api/clusterctl.yaml
+cd -
+
+clusterctl init --infrastructure azurestackhci
 ```
 
-Set `AZURESTACKHCI_CLOUDAGENT_FQDN` on the controller Deployment to the cloudagent's FQDN, and
-create the `default/caphlogintoken` Secret described above.
+Then set `AZURESTACKHCI_CLOUDAGENT_FQDN` on the controller Deployment in `caph-system` to the
+cloudagent's FQDN, and create the `default/caphlogintoken` Secret described above.
 
-Use `make deploy` rather than applying `config/crd/bases/*.yaml` by hand. In CAPI v1beta2 an
-`infrastructureRef` names an `apiGroup` and no version — the version is resolved from the
-`cluster.x-k8s.io/v1beta2` contract label on the referenced CRD. CAPHCI adds that label from its
-kustomization, not from the CRD sources, so hand-applied CRDs come out unlabelled and every
-reference in `templates/` silently fails to resolve.
+Two warnings about that sequence:
+
+* `create-local-provider-repository` **overwrites `~/.cluster-api/clusterctl.yaml` wholesale** —
+  `cat hack/clusterctl.yaml | envsubst > $HOME/.cluster-api/clusterctl.yaml`. Back up any existing
+  provider config first.
+* There is no `make deploy` target, despite what most CAPI providers offer. `make deployment`
+  exists but it also builds and pushes a container image and creates its own kind cluster.
+
+Install it this way rather than applying `config/crd/bases/*.yaml` by hand, for two independent
+reasons:
+
+* In CAPI v1beta2 an `infrastructureRef` names an `apiGroup` and no version — the version is
+  resolved from the `cluster.x-k8s.io/v1beta2` contract label on the referenced CRD. CAPHCI adds
+  that label from `config/crd/kustomization.yaml`, not from the CRD sources, so hand-applied CRDs
+  come out unlabelled and every reference in `templates/` silently fails to resolve.
+* `clusterctl move` discovers what to move by listing CRDs that carry the
+  `clusterctl.cluster.x-k8s.io` label, which only `clusterctl` itself applies. A hand-applied — or
+  even a plain `kubectl apply -f infrastructure-components.yaml` — installation cannot be pivoted.
 
 Check that the CRDs landed with `v1beta2` as the storage version — that is what the controllers
 reconcile against and what these templates are written for:
@@ -138,9 +152,21 @@ preflight block before it does anything expensive.
 
 ### `install-config.yaml`
 
-Create one in the guest cluster directory. It must have:
+A fully commented example is in [cluster/install-config.yaml](cluster/install-config.yaml), with a
+citation for every field that is load-bearing. Copy it into the guest cluster directory and edit
+the addresses, the pull secret and the SSH key.
+
+**`openshift-install create install-config` cannot generate this.** The wizard has no baremetal VIP
+prompts and no capability prompts, and it validates before writing, so it exits with
+`platform.baremetal.apiVIPs: Required value` and `platform.baremetal.hosts: Required value`. Write
+the file by hand.
+
+The parts that matter:
 
 ```yaml
+networking:
+  machineNetwork:
+    - cidr: 192.168.1.0/24     # must contain both VIPs; the 10.0.0.0/16 default will not
 platform:
   baremetal:
     apiVIPs:
@@ -148,14 +174,27 @@ platform:
     ingressVIPs:
       - 192.168.1.11
     provisioningNetwork: Disabled
+    # no hosts[] -- see below
 compute:
   - name: worker
     replicas: 0
 capabilities:
   baselineCapabilitySet: None
   additionalEnabledCapabilities:
-    - ...      # anything you want, but NOT MachineAPI
+    - baremetal              # required: "platform baremetal requires the baremetal capability"
+    - Ingress                # required: "the Ingress capability is required"
+    # ...anything else you want, but NOT MachineAPI
 ```
+
+Both `baremetal` and `Ingress` are mandatory — the installer rejects the config without them. Note
+what the `baremetal` capability drags in: the cluster-baremetal-operator, deployed into
+`openshift-machine-api` in a cluster that has no Machine or BareMetalHost API. With
+`provisioningNetwork: Disabled` it should have nothing to reconcile, but that combination is not
+one Red Hat tests. Watch `oc get clusteroperator baremetal` on the first install.
+
+Also do **not** set `platform.baremetal.loadBalancer.type: UserManaged`. That tells MCO you are
+supplying your own load balancer and it stops deploying the keepalived and haproxy static pods,
+which are the only thing serving the VIPs here.
 
 Why `platform: baremetal` with MachineAPI disabled: the installer's validation gates both the
 "bare metal hosts are missing" error and `ValidateHosts` on the MachineAPI capability being
@@ -167,9 +206,18 @@ networking stack, which is what removes the need for a load balancer.
 `apiVIPs` and `ingressVIPs` are required, must be inside the machine network, and must differ from
 each other. `apiVIPs[0]` must match `API_VIP` in `azurelocal.env`.
 
-`create-cluster.sh` fails loudly if the installer generates Machine API manifests anyway — that
-would mean the capability was not actually disabled and everything downstream is built on a false
-assumption.
+`create-cluster.sh` fails loudly if the installer generates Machine API objects anyway — that would
+mean the capability was not actually disabled and everything downstream is built on a false
+assumption. It greps the generated manifests for `kind: Machine`, `MachineSet`,
+`ControlPlaneMachineSet` and `BareMetalHost` rather than matching on filenames, because the
+installer still writes `openshift/99_openshift-cluster-api_{master,worker}-user-data-secret.yaml`
+with MachineAPI disabled. Those two are just the pointer ignition Secrets and are harmless.
+
+This whole configuration was checked end to end against `openshift-install`
+5.0.0-0.nightly-2026-07-28-081944: `create manifests` and `create ignition-configs` both succeed,
+`mastersSchedulable` is set to `true` automatically, and the only `kind:`s produced under
+`openshift/` are ConfigMap, FeatureGate, MachineConfig, OSImageStream, Provisioning and Secret —
+no Machines, MachineSets, ControlPlaneMachineSet or BareMetalHosts.
 
 ### `azurelocal.env`
 
@@ -227,12 +275,21 @@ Two costs worth knowing before you start:
   between clusters, and they go stale with the 24-hour bootstrap certificate lifetime. Every
   install attempt means rebuilding and re-uploading three multi-GB images.
 * **The bootstrap ignition is modified before it is baked in.** On `platform: baremetal` the
-  installer always adds five Ironic/Metal3 units to `bootstrap.ign` — the switch is on platform
-  name only, not gated on the MachineAPI capability. `master-bmh-update.service` waits forever for
-  a `BareMetalHost` CRD that a MachineAPI-disabled cluster never creates, and the step *after* that
+  installer always adds Ironic/Metal3 to `bootstrap.ign` — the switch is on platform name only, not
+  gated on the MachineAPI capability. `master-bmh-update.service` waits forever for a
+  `BareMetalHost` CRD that a MachineAPI-disabled cluster never creates, and the step *after* that
   wait is the one that shuts down the ironic containers so the API VIP can fail over to the control
-  plane. Left in place, the bootstrap node keeps the VIP and the install cannot complete.
-  `build-image.sh` strips those five units and their backing scripts with `jq`.
+  plane. It is also `Before=progress.service`, so bootstrap progress reporting stalls behind it.
+  Left in place, the bootstrap node keeps the VIP and the install cannot complete.
+
+  `build-image.sh` strips it with `jq`. Confirmed against a real `bootstrap.ign` from
+  `openshift-install` 5.0.0: **four** systemd units (`build-ironic-env`, `build-metal3-env`,
+  `master-bmh-update`, `provisioning-interface` — `extract-machine-os.service` no longer exists),
+  their four backing scripts, and **seven Quadlet files** under `/etc/containers/systemd/`. The
+  Quadlets matter: they are not `systemd.units` entries, so removing the units does not remove
+  them, and `metal3-baremetal-operator.container` has `Restart=always`. `strip_ironic_units` warns
+  if the unit count it removes does not match what it expected, because silence there is the
+  dangerous outcome.
 
 ## Bootstrapping the cluster
 
@@ -271,7 +328,14 @@ The full list, with source citations, is in
   the `azurestack` VHD is the fallback base, but its `ignition.platform.id=azurestack` reintroduces
   the CustomData question and would need a karg override.
 * **The Ironic strip is the assumption most in need of a real test.** With ironic gone there should
-  be no VIP contention and keepalived's normal priority handover should apply — should.
+  be no VIP contention and keepalived's normal priority handover should apply — should. The strip
+  itself is verified against a real 5.0.0 `bootstrap.ign`; what is unverified is what the bootstrap
+  node does afterwards.
+* **The `baremetal` capability installs the cluster-baremetal-operator into a cluster with no
+  Machine API.** Installer validation requires the capability for `platform: baremetal`, and CBO is
+  gated on that capability alone, so it is deployed. With `provisioningNetwork: Disabled` it should
+  have nothing to reconcile, but nobody tests this pairing. `oc get clusteroperator baremetal` is
+  the thing to watch on the first install.
 * **No guest-cluster node lifecycle.** MachineAPI is off and there is no Azure Local CCM or CSI
   driver. Workers are static, CSRs are approved by hand, there are no dynamic PVs and no
   `Service type=LoadBalancer`. The worker image is built and uploaded but nothing in the PoC

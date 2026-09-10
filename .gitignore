@@ -1,0 +1,22 @@
+# openshift-install artefacts. cluster/install-config.yaml is the committed example, everything
+# else a real run drops in a cluster directory is either secret or machine-generated.
+#
+# bootstrap.ign in particular embeds the cluster root CA private key and the pull secret, and
+# auth/kubeconfig is a cluster-admin credential. Neither belongs in git.
+*.ign
+auth/
+metadata.json
+.openshift_install.log
+.openshift_install_state.json
+000_capi-namespace.yaml
+manifests/
+openshift/
+tls/
+
+# Per-cluster environment, which holds the base64 SSH key and the MOC resource names.
+azurelocal.env
+
+# Image build scratch space.
+*.raw
+*.vhdx
+*.raw.gz

@@ -1,0 +1,168 @@
+# Example install-config.yaml for the Azure Local / CAPHCI PoC.
+#
+# `openshift-install create install-config` CANNOT produce this file. The wizard offers no
+# baremetal VIP prompts and no capability prompts, and it validates the assembled config before
+# writing it, so it fails with:
+#
+#   platform.baremetal.apiVIPs: Required value: must specify at least one VIP for the API
+#   platform.baremetal.ingressVIPs: Required value: must specify at least one VIP for the Ingress
+#   platform.baremetal.hosts: Invalid value: null: bare metal hosts are missing
+#   platform.baremetal.hosts: Required value: not enough hosts found (0) ...
+#
+# The last two only appear because the wizard has no way to disable the MachineAPI capability --
+# which is the single thing that makes this whole configuration legal. So the file is written by
+# hand.
+#
+# This file was checked against openshift-install 5.0.0-0.nightly-2026-07-28-081944: with the
+# pull secret and SSH key filled in, both `create manifests` and `create ignition-configs` exit
+# zero and produce no Machine API objects.
+#
+# Every value below is an example. The addresses are consistent with the ones in
+# ../azurelocal.env.example so the two can be read side by side.
+#
+# `openshift-install create manifests` CONSUMES this file -- it is deleted once the install state
+# is created. Keep a copy outside the cluster directory before running create-cluster.sh.
+
+apiVersion: v1
+
+# Cluster domain is <metadata.name>.<baseDomain>, i.e. ocp.example.com here. You need, out of
+# band, an A record for api.ocp.example.com -> apiVIPs[0] and a wildcard A record for
+# *.apps.ocp.example.com -> ingressVIPs[0]. Nothing in this PoC creates DNS.
+baseDomain: example.com
+metadata:
+  name: ocp
+
+controlPlane:
+  name: master
+  replicas: 3
+  architecture: amd64
+  # No platform stanza. Sizing lives in azurelocal.env as CONTROL_PLANE_VM_SIZE, because the VMs
+  # are created by CAPHCI, not by the installer.
+
+compute:
+  - name: worker
+    # Must be 0. The installer would otherwise generate worker MachineSets it cannot fulfil, and
+    # with MachineAPI disabled it generates nothing for workers anyway. Workers are added out of
+    # band -- see the "no guest-cluster node lifecycle" gap in docs/azurestackhci-port-plan.md.
+    replicas: 0
+
+networking:
+  networkType: OVNKubernetes
+  # machineNetwork MUST be set explicitly. The default is 10.0.0.0/16, and both VIPs are
+  # validated to be inside a machine network (ValidateIPinMachineCIDR), so the default would
+  # reject any realistic VIP. Set this to the L2 segment the MOC Transparent vnet bridges onto --
+  # the same segment your DHCP reservations come from. MCO's nodeip-configuration picks the node's
+  # primary interface by matching an address in this CIDR, so getting it wrong misconfigures
+  # keepalived rather than failing loudly.
+  #
+  # Azure Local is IPv4 only, so no dual-stack here.
+  machineNetwork:
+    - cidr: 192.168.1.0/24
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  serviceNetwork:
+    - 172.30.0.0/16
+
+platform:
+  baremetal:
+    # Both are required on baremetal (validateAPIAndIngressVIPs is called with vipIsRequired=true
+    # and reqVIPinMachineCIDR=true), must be valid IPs inside machineNetwork, and must differ from
+    # each other. They must also be free -- not the segment's gateway or DNS server, and not
+    # inside any DHCP pool.
+    #
+    # These are not load balancer addresses that we create. On baremetal the machine-config
+    # operator runs keepalived, haproxy and coredns as static pods on the nodes, and those serve
+    # the API VIP, api-int, the machine config server on 22623 and the ingress VIP from inside the
+    # cluster. That is the entire reason this PoC uses platform: baremetal and can skip CAPHCI's
+    # load balancer.
+    #
+    # apiVIPs[0] must match API_VIP in azurelocal.env.
+    apiVIPs:
+      - 192.168.1.10
+    ingressVIPs:
+      - 192.168.1.11
+
+    # There is no provisioning network: nothing here PXE-boots anything, and the VMs are created
+    # by CAPHCI from a gallery image. Disabled is what stops the installer defaulting a
+    # 172.22.0.0/24 provisioning CIDR with bootstrap/cluster provisioning IPs on it.
+    #
+    # This does NOT stop the installer emitting openshift/99_baremetal-provisioning-config.yaml.
+    # That manifest is written on platform name alone (pkg/asset/manifests/openshift.go), not
+    # gated on any capability, so the cluster-baremetal-operator gets a Provisioning CR with
+    # provisioningNetwork: Disabled -- which is the intent.
+    provisioningNetwork: Disabled
+
+    # hosts: DELIBERATELY ABSENT.
+    #
+    # pkg/types/baremetal/validation/platform.go gates both the "bare metal hosts are missing"
+    # error and the whole ValidateHosts call on
+    #   !agentBasedInstallation && enabledCaps.Has(ClusterVersionCapabilityMachineAPI)
+    # so with MachineAPI off below, platform: baremetal is legal with no hosts and no BMC
+    # credentials. Adding a hosts entry here would drag BMC address/username/password validation
+    # back in for machines that have no BMC.
+
+    # Do NOT set loadBalancer.type: UserManaged. That tells MCO you are supplying your own load
+    # balancer and it stops deploying the keepalived/haproxy static pods -- which are the only
+    # thing serving the VIPs in this design.
+
+    # bootstrapOSImage / clusterOSImage are also deliberately absent. They point the installer's
+    # own baremetal bootstrap flow at RHCOS artifacts; here lib/build-image.sh resolves the RHCOS
+    # metal artifact itself and bakes each role's ignition into its own VHD.
+
+capabilities:
+  # Start from nothing and add back only what is needed. `None` is what makes MachineAPI
+  # disable-able at all -- there is no way to subtract a capability from a baseline set.
+  baselineCapabilitySet: None
+
+  # MachineAPI is the one that MUST NOT appear here. Enabling it would:
+  #   * reinstate the hosts[] requirement above,
+  #   * generate master Machines, worker MachineSets, BareMetalHosts and a ControlPlaneMachineSet
+  #     for infrastructure the installer does not own,
+  # and create-cluster.sh fails loudly if it sees openshift/99_openshift-cluster-api_* appear,
+  # because everything downstream assumes they do not exist.
+  additionalEnabledCapabilities:
+    # Required: pkg/types/validation/installconfig.go rejects platform baremetal with
+    # baselineCapabilitySet: None unless the baremetal capability is enabled
+    # ("platform baremetal requires the baremetal capability").
+    #
+    # Note the consequence, which is an open risk in this PoC: this installs the
+    # cluster-baremetal-operator into openshift-machine-api, in a cluster that has no Machine or
+    # BareMetalHost API. The openshift-machine-api Namespace manifest carries no capability
+    # annotation so it is still created, and with provisioningNetwork: Disabled CBO should settle
+    # into a virtual-media-only metal3 deployment with nothing to reconcile -- but this
+    # combination is not a configuration Red Hat tests. Watch `oc get clusteroperator baremetal`
+    # on first install; if it never goes Available the install will not complete.
+    - baremetal
+
+    # Required unconditionally: "the Ingress capability is required". Without it there is no
+    # ingress controller to answer the ingress VIP.
+    - Ingress
+
+    # Everything below is optional and off. Uncomment what you actually want; each one is a
+    # cluster operator that must go Available before the install completes, so the minimal set
+    # above is also the fastest and least likely to wedge.
+    #
+    # - Console                     # web console
+    # - Insights                    # telemetry / support
+    # - Storage                     # CSI operators; nothing here provides storage
+    # - CSISnapshot
+    # - NodeTuning
+    # - ImageRegistry               # no backing storage available in this PoC
+    # - OperatorLifecycleManager
+    # - marketplace                 # requires OperatorLifecycleManager
+    # - openshift-samples
+    # - Build
+    # - DeploymentConfig
+    # - CloudCredential             # may be disabled only on baremetal/None; nothing needs it here
+    # - CloudControllerManager      # there is no Azure Local CCM, so leave this off
+
+# Replace with the contents of your pull secret (single line of JSON).
+pullSecret: '{"auths":{"cloud.openshift.com":{"auth":"REDACTED","email":"you@example.com"}}}'
+
+# Strongly recommended. There is no console, no CCM and no Machine API here, so SSH to the nodes
+# is the only debugging channel when a node fails to join.
+#
+# This is the plaintext key. azurelocal.env's SSH_PUBLIC_KEY_B64 is the SAME key base64-encoded,
+# for CAPHCI, which runs base64.StdEncoding.DecodeString() over it. Keep the two in sync.
+sshKey: 'ssh-ed25519 AAAA... you@example.com'
